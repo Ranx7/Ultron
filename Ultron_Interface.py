@@ -122,9 +122,74 @@ CODE INSPECTION RULES:
 - If something cannot be found in the supplied source, say:
   "I cannot find that in the supplied source."
 - Do not fabricate imports, functions, classes, routes, variables, or implementations.
-
-
 """.strip()
+
+
+# ============================================================
+# MEMORY RETRIEVAL GATING
+# ============================================================
+
+MEMORY_HINTS = (
+    "remember",
+    "recall",
+    "forgot",
+    "forget",
+    "earlier",
+    "before",
+    "yesterday",
+    "last time",
+    "previous",
+    "what did i say",
+    "what was",
+    "we discussed",
+    "we talked about",
+    "do you remember",
+)
+
+
+SIMPLE_MESSAGES = {
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "sup",
+    "hi ultron",
+    "hello ultron",
+    "hey ultron",
+    "yo ultron",
+    "thanks",
+    "thank you",
+    "ok",
+    "okay",
+    "lol",
+}
+
+
+def should_retrieve_memory(user_message):
+    """
+    Decide whether the user's message is asking about
+    previous information.
+
+    This prevents ordinary conversation from automatically
+    searching the long-term memory database.
+    """
+
+    text = " ".join(
+        user_message.casefold().split()
+    )
+
+    if not text:
+        return False
+
+    # Simple social messages should never trigger memory retrieval.
+    if text in SIMPLE_MESSAGES:
+        return False
+
+    # Explicit references to previous information trigger retrieval.
+    return any(
+        hint in text
+        for hint in MEMORY_HINTS
+    )
 
 
 # ============================================================
@@ -195,112 +260,126 @@ def build_context(user_message):
         }
     ]
 
+    retrieve_memory = should_retrieve_memory(
+        user_message
+    )
+
 
     # --------------------------------------------------------
     # LONG-TERM MEMORY
     # --------------------------------------------------------
 
-    memories = search_memories(
-        user_message,
-        limit=6
-    )
+    if retrieve_memory:
 
-    if memories:
-
-        memory_ids = [
-            m["id"]
-            for m in memories
-        ]
-
-        touch_memories(
-            memory_ids
+        memories = search_memories(
+            user_message,
+            limit=6
         )
 
-        memory_text = "\n".join(
-            f"- {m['content']}"
-            for m in memories
-        )
+        if memories:
 
-        context.append(
-            {
-                "role": "system",
-                "content": (
-                    "Relevant long-term memories:\n"
-                    + memory_text
-                ),
-            }
-        )
+            memory_ids = [
+                m["id"]
+                for m in memories
+            ]
 
-
-    # --------------------------------------------------------
-    # RELEVANT OLD CONVERSATION
-    # --------------------------------------------------------
-
-    old = search_conversation(
-        user_message,
-        limit=4
-    )
-
-    if old:
-
-        old_text = "\n".join(
-            (
-                f"[{m['created_at']}] "
-                f"{m['role']}: "
-                f"{m['content']}"
+            touch_memories(
+                memory_ids
             )
-            for m in old
+
+            memory_text = "\n".join(
+                f"- {m['content']}"
+                for m in memories
+            )
+
+            context.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Relevant long-term memories:\n"
+                        + memory_text
+                    ),
+                }
+            )
+
+
+        # ----------------------------------------------------
+        # RELEVANT OLD CONVERSATION
+        # ----------------------------------------------------
+
+        old = search_conversation(
+            user_message,
+            limit=4
         )
 
-        context.append(
-            {
-                "role": "system",
-                "content": (
-                    "Relevant historical conversation excerpts.\n"
-                    "These may be from an earlier point in time and "
-                    "are provided only because they matched the topic:\n\n"
-                    + old_text
-                ),
-            }
-        )
+        if old:
+
+            old_text = "\n".join(
+                (
+                    f"[{m['created_at']}] "
+                    f"{m['role']}: "
+                    f"{m['content']}"
+                )
+                for m in old
+            )
+
+            context.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Relevant historical conversation excerpts.\n"
+                        "These may be from an earlier point in time and "
+                        "are provided only because they matched the topic:\n\n"
+                        + old_text
+                    ),
+                }
+            )
 
 
     # --------------------------------------------------------
     # RECENT CONVERSATION
     # --------------------------------------------------------
 
-    recent = get_recent_messages(
-        limit=6
+    normalized_message = " ".join(
+        user_message.casefold().split()
     )
 
-    if recent:
+    # Greetings and other simple social messages don't need
+    # previous conversation injected into the prompt.
+    if normalized_message not in SIMPLE_MESSAGES:
 
-        recent_context = [
-            {
-                "role": "system",
-                "content": (
-                    "Recent conversation, in chronological order. "
-                    "Use timestamps to distinguish older messages "
-                    "from the newest request."
-                ),
-            }
-        ]
+        recent = get_recent_messages(
+            limit=6
+        )
 
-        for message in recent:
+        if recent:
 
-            recent_context.append(
+            recent_context = [
                 {
-                    "role": message["role"],
+                    "role": "system",
                     "content": (
-                        f"[Timestamp: {message['created_at']}]\n"
-                        f"{message['content']}"
+                        "Recent conversation, in chronological order. "
+                        "Use timestamps to distinguish older messages "
+                        "from the newest request."
                     ),
                 }
-            )
+            ]
 
-        context.extend(
-            recent_context
-        )
+            for message in recent:
+
+                recent_context.append(
+                    {
+                        "role": message["role"],
+                        "content": (
+                            f"[Timestamp: {message['created_at']}]\n"
+                            f"{message['content']}"
+                        ),
+                    }
+                )
+
+            context.extend(
+                recent_context
+            )
 
 
     # --------------------------------------------------------
@@ -523,10 +602,7 @@ def chat():
                     yield text
 
 
-                # Save Ultron's code-inspection response so it
-                # can remember that the inspection actually
-                # happened in the conversation.
-
+                # Save Ultron's code-inspection response.
                 add_message(
                     "assistant",
                     full_response
@@ -568,9 +644,6 @@ def chat():
         user_message,
         source_message_id=user_id,
     )
-
-
-    
 
 
     def generate():

@@ -118,6 +118,152 @@ def _fts_query(text):
 
 
 # ============================================================
+# MEMORY TOPIC DETECTION
+# ============================================================
+
+def find_memory_topics(
+    query,
+    limit=DEFAULT_MEMORY_LIMIT
+):
+    """
+    Determine whether the user's message actually overlaps
+    with topics currently stored in long-term memory.
+
+    This is intentionally different from simply searching
+    memories and accepting whatever FTS happens to return.
+
+    A query such as:
+
+        "hi ultron"
+
+    should not cause unrelated memories to be retrieved.
+
+    A query such as:
+
+        "what happened with my Python project?"
+
+    can retrieve memories containing Python/project-related
+    information.
+    """
+
+    terms = _extract_terms(query)
+
+    if not terms:
+        return []
+
+
+    # --------------------------------------------------------
+    # SEARCH FOR TOPIC OVERLAP
+    # --------------------------------------------------------
+
+    fts = _fts_query(query)
+
+    if not fts:
+        return []
+
+
+    limit = max(
+        1,
+        min(int(limit), 50)
+    )
+
+    conn = get_connection()
+
+    try:
+
+        rows = conn.execute(
+            """
+            SELECT
+                m.id,
+                m.content,
+                m.memory_type,
+                m.importance,
+                m.last_accessed,
+                m.access_count,
+                memories_fts.rank AS relevance
+
+            FROM memories_fts
+
+            JOIN memories AS m
+                ON m.id = memories_fts.rowid
+
+            WHERE memories_fts MATCH ?
+              AND m.active = 1
+
+            ORDER BY
+                memories_fts.rank ASC,
+                m.importance DESC,
+                m.access_count DESC
+
+            LIMIT ?
+            """,
+            (
+                fts,
+                limit
+            )
+        ).fetchall()
+
+
+        results = [
+            dict(row)
+            for row in rows
+        ]
+
+
+        # ----------------------------------------------------
+        # REQUIRE ACTUAL TOPIC OVERLAP
+        # ----------------------------------------------------
+
+        # FTS already performed the broad matching.
+        # We now make sure at least one meaningful query
+        # term is actually present in the memory text.
+
+        verified = []
+
+        for memory in results:
+
+            memory_text = _normalize_text(
+                memory["content"]
+            ).lower()
+
+            matched_terms = [
+                term
+                for term in terms
+                if term in memory_text
+            ]
+
+            if not matched_terms:
+                continue
+
+            memory["matched_terms"] = matched_terms
+
+            verified.append(
+                memory
+            )
+
+
+        return verified
+
+    finally:
+
+        conn.close()
+
+
+def has_memory_topic(query):
+    """
+    Return True only when the query appears to reference
+    something that actually exists in long-term memory.
+    """
+
+    return bool(
+        find_memory_topics(
+            query,
+            limit=1
+        )
+    )
+
+
+# ============================================================
 # MESSAGE IMPORTANCE FOR RETRIEVAL
 # ============================================================
 
@@ -177,60 +323,15 @@ def search_memories(
     limit=DEFAULT_MEMORY_LIMIT
 ):
 
-    fts = _fts_query(query)
+    """
+    Search long-term memories only when the query has
+    meaningful overlap with stored memory topics.
+    """
 
-    if not fts:
-        return []
-
-    limit = max(
-        1,
-        min(int(limit), 50)
+    return find_memory_topics(
+        query,
+        limit=limit
     )
-
-    conn = get_connection()
-
-    try:
-
-        rows = conn.execute(
-            """
-            SELECT
-                m.id,
-                m.content,
-                m.memory_type,
-                m.importance,
-                m.last_accessed,
-                m.access_count,
-                memories_fts.rank AS relevance
-
-            FROM memories_fts
-
-            JOIN memories AS m
-                ON m.id = memories_fts.rowid
-
-            WHERE memories_fts MATCH ?
-              AND m.active = 1
-
-            ORDER BY
-                memories_fts.rank ASC,
-                m.importance DESC,
-                m.access_count DESC
-
-            LIMIT ?
-            """,
-            (
-                fts,
-                limit
-            )
-        ).fetchall()
-
-        return [
-            dict(row)
-            for row in rows
-        ]
-
-    finally:
-
-        conn.close()
 
 
 # ============================================================
