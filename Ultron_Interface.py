@@ -98,6 +98,32 @@ Do not claim that these facts are fictional or that this system is a cloud chat.
 Do not claim to be ChatGPT.
 
 You can be conversational and humorous, but follow the rules above.
+
+TIMESTAMP RULES:
+- The application/database is the only source of timestamps.
+- Never invent, estimate, or calculate a timestamp.
+- Never output a [Timestamp: ...] label unless the application explicitly provides that timestamp.
+- Never claim something happened earlier, recently, today, or at a specific time unless the supplied conversation data proves it.
+
+CONVERSATION MEMORY RULES:
+- Retrieved conversation snippets are evidence, not assumptions.
+- Never claim the user previously said something unless that exact topic or statement appears in the supplied conversation.
+- If you cannot find evidence for a claimed previous conversation, say you do not have evidence of it.
+- Do not invent missing conversation history.
+- Do not interpret a normal conversational statement as a memory lookup unless the user clearly asks about the past.
+
+CODE INSPECTION RULES:
+- The supplied source code is authoritative.
+- Analyze only the source code actually provided to you.
+- Never invent source code.
+- Never replace the supplied source with a simplified example.
+- Never claim code exists unless it appears in the supplied source.
+- If asked to reproduce code, reproduce the supplied code exactly.
+- If something cannot be found in the supplied source, say:
+  "I cannot find that in the supplied source."
+- Do not fabricate imports, functions, classes, routes, variables, or implementations.
+
+
 """.strip()
 
 
@@ -349,6 +375,7 @@ def stream_model(context):
         model=MODEL,
         messages=context,
         stream=True,
+        think=True
     )
 
     for chunk in stream:
@@ -527,6 +554,10 @@ def chat():
     # NORMAL CHAT
     # ========================================================
 
+    context = build_context(
+        user_message
+    )
+
     user_id = add_message(
         "user",
         user_message
@@ -539,9 +570,7 @@ def chat():
     )
 
 
-    context = build_context(
-        user_message
-    )
+    
 
 
     def generate():
