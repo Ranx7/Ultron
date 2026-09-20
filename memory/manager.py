@@ -1,802 +1,1204 @@
-import re
-import unicodedata
+"""
+Ultron memory manager.
 
-from nltk.tokenize import RegexpTokenizer
-from nltk.stem import SnowballStemmer
+Responsibilities:
 
-from .database import add_or_update_memory
+    CURRENT USER MESSAGE
+            |
+            v
+    memory candidate analysis
+            |
+            v
+    semantic duplicate search
+            |
+            v
+    conflict / duplicate resolution
+            |
+            v
+    add / replace / merge / ignore
 
+Important architectural rules:
+
+    - Only USER messages enter this pipeline.
+    - The current message is the primary source of truth.
+    - Recent context may be supplied for resolving references.
+    - Old conversation history is NOT automatically searched here.
+    - Assistant messages are never turned into memories.
+    - Memories are stored as durable facts, preferences, goals,
+      project information, decisions, corrections, etc.
+    - Semantic similarity is used for deduplication.
+    - An LLM makes the actual memory-worthiness decision.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+import requests
+
+from .database import (
+    add_or_update_memory,
+    archive_memory,
+)
+from .retrieval import semantic_search
+from .embeddings import embed_memory
 
 # ============================================================
-# NLTK SETUP
+# Configuration
 # ============================================================
 
-# No downloaded NLTK corpus required.
-TOKENIZER = RegexpTokenizer(
-    r"[A-Za-z0-9_']+"
+OLLAMA_URL = os.getenv(
+    "ULTRON_OLLAMA_URL",
+    "http://localhost:11434",
 )
 
-STEMMER = SnowballStemmer(
-    "english"
+OLLAMA_MODEL = os.getenv(
+    "ULTRON_MEMORY_MODEL",
+    "Ultron:latest",
 )
 
+# Similarity above this value means an existing memory is
+# probably talking about the same thing.
+RELATED_MEMORY_THRESHOLD = 0.75
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+AUTO_DUPLICATE_THRESHOLD = 0.85
 
-MIN_MEMORY_SCORE = 4
-MAX_MEMORY_TEXT = 500
+# Never allow one user message to create an unreasonable
+# number of durable memories.
+MAX_MEMORIES_PER_MESSAGE = 3
 
-MAX_TOPICS = 8
+# Maximum candidate length stored in the database.
+MAX_MEMORY_LENGTH = 1200
 
-
-# ============================================================
-# STOPWORDS
-# ============================================================
-
-STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "been",
-    "being", "but", "by", "can", "could", "did", "do",
-    "does", "for", "from", "had", "has", "have", "he",
-    "her", "here", "him", "his", "how", "i", "if", "in",
-    "into", "is", "it", "its", "just", "me", "more", "most",
-    "my", "of", "on", "or", "our", "ours", "she", "so",
-    "some", "than", "that", "the", "their", "them", "then",
-    "there", "these", "they", "this", "those", "to", "too",
-    "us", "very", "was", "we", "were", "what", "when",
-    "where", "which", "who", "why", "will", "with", "would",
-    "you", "your", "yours",
+# Allowed durable memory categories.
+ALLOWED_MEMORY_TYPES = {
+    "fact",
+    "preference",
+    "goal",
+    "project",
+    "technical",
+    "decision",
+    "correction",
 }
 
 
 # ============================================================
-# COMMON NON-TOPIC WORDS
+# Data structures
 # ============================================================
 
-GENERIC_TOPIC_WORDS = {
-    "thing",
-    "things",
-    "stuff",
-    "something",
-    "someone",
-    "somebody",
-    "really",
-    "good",
-    "great",
-    "nice",
-    "new",
-    "old",
-    "current",
-    "currently",
-    "today",
-    "tomorrow",
-    "yesterday",
-    "time",
-    "way",
-    "part",
-    "idea",
-    "problem",
-    "question",
-    "answer",
-    "work",
-    "working",
-    "use",
-    "using",
-    "used",
-    "make",
-    "making",
-    "made",
-    "build",
-    "building",
-    "built",
-    "want",
-    "need",
-    "like",
-    "love",
-    "think",
-    "know",
-    "got",
-    "get",
-}
-
-
-# ============================================================
-# TECHNICAL TOPICS
-# ============================================================
-
-TECHNICAL_TOPICS = {
-    "python",
-    "javascript",
-    "typescript",
-    "java",
-    "csharp",
-    "c++",
-    "rust",
-    "flask",
-    "ollama",
-    "llama",
-    "qwen",
-    "sqlite",
-    "nltk",
-    "esp32",
-    "esp32s3",
-    "blender",
-    "linux",
-    "windows",
-    "android",
-    "github",
-    "gpu",
-    "cpu",
-    "model",
-    "database",
-    "server",
-    "api",
-    "html",
-    "css",
-    "javascript",
-    "node",
-    "nodejs",
-    "react",
-    "pyqt",
-    "pytorch",
-    "tensorflow",
-    "machine",
-    "learning",
-    "neural",
-    "network",
-}
-
-
-# ============================================================
-# NORMALIZATION
-# ============================================================
-
-def _normalize(text):
-
-    if not text:
-        return ""
-
-    return unicodedata.normalize(
-        "NFKC",
-        str(text)
-    ).strip()
-
-
-# ============================================================
-# SENTENCE SPLITTING
-# ============================================================
-
-def _split_sentences(text):
-
-    text = _normalize(text)
-
-    if not text:
-        return []
-
-    parts = re.split(
-        r"(?<=[.!?])\s+|\n+",
-        text
-    )
-
-    return [
-        part.strip()
-        for part in parts
-        if part.strip()
-    ]
-
-
-# ============================================================
-# TOKENIZATION
-# ============================================================
-
-def _tokenize(text):
-
-    return [
-        token.lower()
-        for token in TOKENIZER.tokenize(
-            _normalize(text)
-        )
-    ]
-
-
-# ============================================================
-# STEMMING
-# ============================================================
-
-def _stems(tokens):
-
-    return [
-        STEMMER.stem(token)
-        for token in tokens
-        if len(token) >= 3
-    ]
-
-
-# ============================================================
-# NAME EXTRACTION
-# ============================================================
-
-def _extract_name(text):
-
-    patterns = [
-        r"\bmy name is ([A-Za-z][A-Za-z0-9_-]{1,30})\b",
-        r"\bi am ([A-Za-z][A-Za-z0-9_-]{1,30})\b",
-        r"\bi'm ([A-Za-z][A-Za-z0-9_-]{1,30})\b",
-    ]
-
-    invalid_names = {
-        "here",
-        "fine",
-        "good",
-        "okay",
-        "ok",
-        "trying",
-        "working",
-        "learning",
-        "going",
-        "using",
-        "building",
-        "starting",
-        "looking",
-    }
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
-
-        if not match:
-            continue
-
-        candidate = match.group(1).strip()
-
-        if candidate.lower() in invalid_names:
-            continue
-
-        return candidate
-
-    return None
-
-
-# ============================================================
-# TOPIC EXTRACTION
-# ============================================================
-
-def _extract_topics(text):
-
+@dataclass
+class MemoryCandidate:
     """
-    Extract meaningful topic words from a memory.
-
-    This is intentionally lightweight.
-
-    Example:
-
-        "I'm building a Python automation application"
-
-    becomes approximately:
-
-        ["python", "automation", "application"]
+    A proposed durable memory extracted from the current
+    user message.
     """
 
-    tokens = _tokenize(text)
+    content: str
+    memory_type: str
+    importance: float
+    confidence: float
 
-    topics = []
-    seen = set()
 
-    for token in tokens:
+@dataclass
+class MemoryAction:
+    """
+    Final action after comparing a candidate against existing
+    memories.
+    """
 
-        if len(token) < 3:
-            continue
-
-        if token in STOPWORDS:
-            continue
-
-        if token in GENERIC_TOPIC_WORDS:
-            continue
-
-        if token in seen:
-            continue
-
-        seen.add(token)
-
-        topics.append(token)
-
-    # Give known technical terms priority.
-    topics.sort(
-        key=lambda x: (
-            x not in TECHNICAL_TOPICS,
-            -len(x)
-        )
-    )
-
-    return topics[:MAX_TOPICS]
+    action: str
+    content: str
+    memory_type: str
+    importance: float
 
 
 # ============================================================
-# MEMORY TYPE
+# Analyzer interface
 # ============================================================
 
-def _detect_memory_type(
-    text,
-    lower
-):
+class MemoryAnalyzer(Protocol):
+    """
+    Interface used by the memory manager.
 
-    # Identity
-    if _extract_name(text):
-        return "identity"
+    The manager does not care which model performs the analysis.
 
-    # Preferences
-    if any(
-        phrase in lower
-        for phrase in (
-            "i like",
-            "i love",
-            "i enjoy",
-            "my favorite",
-            "i prefer",
-            "i usually",
-            "i tend to",
-            "i don't like",
-            "i dislike",
-            "i hate",
-            "i avoid",
-            "i don't enjoy",
-        )
-    ):
-        return "preference"
+    This keeps the memory architecture separate from Ollama.
+    """
 
-    # Projects
-    if any(
-        phrase in lower
-        for phrase in (
-            "i am building",
-            "i'm building",
-            "i am making",
-            "i'm making",
-            "i am working on",
-            "i'm working on",
-            "i am developing",
-            "i'm developing",
-            "my project",
-            "my app",
-            "my application",
-            "my system",
-            "i created",
-            "i built",
-            "i made",
-        )
-    ):
-        return "project"
+    def analyze(
+        self,
+        message: str,
+        recent_context: list[dict] | None = None,
+    ) -> list[MemoryCandidate]:
+        ...
 
-    # Goals
-    if any(
-        phrase in lower
-        for phrase in (
-            "i plan to",
-            "i'm planning to",
-            "i am planning to",
-            "i want to",
-            "i intend to",
-            "i'm going to",
-            "i am going to",
-            "i will",
-            "my goal is",
-            "i hope to",
-        )
-    ):
-        return "goal"
-
-    # Personal facts
-    if any(
-        phrase in lower
-        for phrase in (
-            "i live in",
-            "i'm from",
-            "i am from",
-            "i use",
-            "i switched to",
-            "i started",
-            "i learned",
-            "i studied",
-            "i have",
-            "i own",
-        )
-    ):
-        return "personal"
-
-    # Technical
-    tokens = set(_tokenize(text))
-
-    if tokens.intersection(TECHNICAL_TOPICS):
-        return "technical"
-
-    # Date/event
-    if re.search(
-        r"\b(19\d{2}|20\d{2})\b",
-        lower
-    ):
-        return "event"
-
-    return "general"
+    def resolve(
+        self,
+        candidate: MemoryCandidate,
+        existing_memory: dict,
+    ) -> MemoryAction:
+        ...
 
 
 # ============================================================
-# MEMORY CANDIDATE ANALYSIS
+# Ollama analyzer
 # ============================================================
 
-def _analyze_sentence(sentence):
+class OllamaMemoryAnalyzer:
+    """
+    Uses an Ollama model to determine whether the current
+    message contains durable information.
 
-    text = _normalize(sentence)
+    The model is explicitly instructed to return structured JSON.
+    """
 
-    if not text:
-        return None
-
-    if len(text) < 8:
-        return None
-
-    if len(text) > MAX_MEMORY_TEXT:
-        text = text[:MAX_MEMORY_TEXT]
-
-    lower = text.lower()
-
-    tokens = _tokenize(text)
-
-    useful_tokens = [
-        token
-        for token in tokens
-        if token not in STOPWORDS
-    ]
-
-    stems = _stems(
-        useful_tokens
-    )
-
-    # --------------------------------------------------------
-    # QUESTIONS
-    # --------------------------------------------------------
-
-    question = (
-        "?" in text
-        or re.search(
-            r"^\s*(what|why|how|when|where|who|can|could|do|does|did|is|are|would|will)\b",
-            lower
-        )
-    )
-
-    if question:
-
-        if not re.search(
-            r"\bremember\b",
-            lower
-        ):
-            return None
-
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
-    score = 0
-
-    memory_type = _detect_memory_type(
-        text,
-        lower
-    )
-
-    # --------------------------------------------------------
-    # Explicit memory request
-    # --------------------------------------------------------
-
-    if re.search(
-        r"\bremember\b",
-        lower
+    def __init__(
+        self,
+        model: str = OLLAMA_MODEL,
+        base_url: str = OLLAMA_URL,
+        timeout: int = 120,
     ):
-        score += 6
-        memory_type = "explicit"
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
 
     # --------------------------------------------------------
-    # Identity
+    # HTTP
     # --------------------------------------------------------
 
-    name = _extract_name(text)
+    def _chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
 
-    if name:
-
-        return {
-            "save": True,
-            "type": "identity",
-            "importance": 8,
-            "content": f"The user's name is {name}.",
-            "topics": ["identity", "name"],
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": 0.1,
+                "top_p": 0.9,
+            },
         }
 
-    # --------------------------------------------------------
-    # Preferences
-    # --------------------------------------------------------
-
-    if memory_type == "preference":
-        score += 5
-
-    # --------------------------------------------------------
-    # Project
-    # --------------------------------------------------------
-
-    if memory_type == "project":
-        score += 5
-
-    # --------------------------------------------------------
-    # Goal
-    # --------------------------------------------------------
-
-    if memory_type == "goal":
-        score += 4
-
-    # --------------------------------------------------------
-    # Personal
-    # --------------------------------------------------------
-
-    if memory_type == "personal":
-        score += 3
-
-    # --------------------------------------------------------
-    # Technical
-    # --------------------------------------------------------
-
-    technical_hits = sum(
-        1
-        for token in useful_tokens
-        if token in TECHNICAL_TOPICS
-    )
-
-    if technical_hits:
-
-        score += min(
-            technical_hits * 2,
-            4
+        response = requests.post(
+            f"{self.base_url}/api/chat",
+            json=payload,
+            timeout=self.timeout,
         )
 
+        response.raise_for_status()
+
+        data = response.json()
+
+        try:
+            return data["message"]["content"]
+        except (KeyError, TypeError):
+            raise RuntimeError(
+                "Ollama returned an unexpected response."
+            )
+
     # --------------------------------------------------------
-    # Date / event
+    # First-stage memory extraction
     # --------------------------------------------------------
 
-    date_hit = re.search(
-        r"\b(19\d{2}|20\d{2})\b",
-        lower
-    )
+    def analyze(
+        self,
+        message: str,
+        recent_context: list[dict] | None = None,
+    ) -> list[MemoryCandidate]:
 
-    month_names = {
-        "january",
-        "february",
-        "march",
-        "april",
-        "may",
-        "june",
-        "july",
-        "august",
-        "september",
-        "october",
-        "november",
-        "december",
+        context_text = _format_recent_context(
+            recent_context
+        )
+
+        system_prompt = """
+You are Ultron's memory-analysis subsystem.
+
+Your job is NOT to answer the user.
+
+Your job is to decide whether the CURRENT USER MESSAGE
+contains information worth remembering long-term.
+
+A durable memory should usually be something such as:
+
+- a stable user preference
+- an ongoing project
+- a technical environment or setup
+- a long-term goal
+- an important decision
+- a persistent fact about the user's work
+- a correction to information previously stored
+- a durable instruction about how the assistant should behave
+
+Do NOT store:
+
+- greetings
+- small talk
+- jokes
+- temporary requests
+- ordinary questions
+- one-off calculations
+- transient emotional reactions
+- assistant-generated information
+- guesses or assumptions
+- information merely implied by the message
+- entire conversations
+- redundant copies of the same idea
+
+Only store information actually supported by the user's words.
+
+Do not infer sensitive personal information.
+
+The current user message has priority.
+Recent context exists only to resolve references such as
+"that project", "the model I chose", or "my laptop".
+
+Return ONLY valid JSON in this exact structure:
+
+{
+  "memories": [
+    {
+      "content": "short durable statement",
+      "memory_type": "fact",
+      "importance": 0.0,
+      "confidence": 0.0
     }
+  ]
+}
 
-    month_hit = any(
-        month in lower
-        for month in month_names
-    )
+Valid memory_type values:
 
-    if date_hit or month_hit:
+fact
+preference
+goal
+project
+technical
+decision
+correction
 
-        score += 2
+importance must be between 0 and 5.
 
-        if memory_type == "general":
-            memory_type = "event"
+confidence must be between 0 and 1.
 
-    # --------------------------------------------------------
-    # Temporary information
-    # --------------------------------------------------------
+Return an empty memories array when nothing should be stored.
+"""
 
-    temporary_terms = {
-        "today",
-        "tonight",
-        "yesterday",
-        "right",
-        "now",
-        "currently",
-        "just",
-        "earlier",
-        "this morning",
-        "this afternoon",
-        "this evening",
-    }
+        user_prompt = (
+            "CURRENT USER MESSAGE:\n"
+            f"{message}\n\n"
+        )
 
-    temporary_hits = sum(
-        1
-        for phrase in temporary_terms
-        if phrase in lower
-    )
+        if context_text:
+            user_prompt += (
+                "RECENT CONTEXT ONLY:\n"
+                f"{context_text}\n"
+            )
 
-    if temporary_hits:
-        score -= 2
+        raw = self._chat(
+            system_prompt,
+            user_prompt,
+        )
+
+        return _parse_candidates(raw)
 
     # --------------------------------------------------------
-    # Short messages
+    # Duplicate/conflict resolution
     # --------------------------------------------------------
 
-    if len(useful_tokens) <= 2:
-        score -= 3
+    def resolve(
+        self,
+        candidate: MemoryCandidate,
+        existing_memory: dict,
+    ) -> MemoryAction:
 
-    # --------------------------------------------------------
-    # Questions
-    # --------------------------------------------------------
+        system_prompt = """
+You are Ultron's memory-consolidation subsystem.
 
-    if question and not re.search(
-        r"\bremember\b",
-        lower
-    ):
-        score -= 5
+Compare a NEW memory candidate against ONE EXISTING MEMORY.
 
-    # --------------------------------------------------------
-    # Meaningful vocabulary
-    # --------------------------------------------------------
+Determine whether the new information should:
 
-    unique_stems = set(stems)
+"duplicate"
+    The existing memory already contains essentially the
+    same information.
 
-    if len(unique_stems) >= 3:
-        score += 1
+"replace"
+    The new information supersedes or corrects the old memory.
 
-    # --------------------------------------------------------
-    # Topics
-    # --------------------------------------------------------
+"merge"
+    Both contain useful compatible information and should be
+    combined into one concise durable memory.
 
-    topics = _extract_topics(text)
+"new"
+    They are related enough to inspect but are actually
+    different facts and both should remain.
 
-    # A memory without meaningful topics is less useful
-    # for topic-based retrieval.
-    if not topics:
-        score -= 2
+Return ONLY valid JSON:
 
-    # --------------------------------------------------------
-    # FINAL DECISION
-    # --------------------------------------------------------
+{
+  "action": "duplicate",
+  "content": "final memory text",
+  "memory_type": "fact",
+  "importance": 0.0
+}
 
-    save = (
-        score >= MIN_MEMORY_SCORE
-    )
+The content field must contain only the final durable memory
+statement. Do not mention this comparison process.
+"""
 
-    if not save:
-        return None
+        user_prompt = (
+            "NEW MEMORY CANDIDATE:\n"
+            f"{candidate.content}\n\n"
+            "NEW TYPE:\n"
+            f"{candidate.memory_type}\n\n"
+            "EXISTING MEMORY:\n"
+            f"{existing_memory.get('content', '')}\n\n"
+            "EXISTING TYPE:\n"
+            f"{existing_memory.get('memory_type', 'fact')}"
+        )
 
-    return {
-        "save": True,
-        "type": memory_type,
-        "importance": min(
-            max(score, 1),
-            10
-        ),
-        "content": text,
-        "topics": topics,
-    }
+        raw = self._chat(
+            system_prompt,
+            user_prompt,
+        )
+
+        return _parse_action(
+            raw,
+            fallback=candidate,
+        )
 
 
 # ============================================================
-# MEMORY STORAGE
+# Parsing
 # ============================================================
 
-def _save_candidate(
-    candidate,
-    source_message_id=None
-):
+def _strip_json_fences(text: str) -> str:
+    """
+    Remove markdown JSON fences if a model adds them despite
+    being instructed not to.
+    """
 
-    if not candidate:
-        return
+    text = text.strip()
 
-    # --------------------------------------------------------
-    # IMPORTANT
-    # --------------------------------------------------------
-    #
-    # Your current database schema stores:
-    #
-    #   content
-    #   memory_type
-    #   importance
-    #
-    # It does not currently have a topics column.
-    #
-    # Therefore we keep topics attached to the returned
-    # candidate for the new retrieval logic, while preserving
-    # compatibility with your existing database.py.
-    #
-    # The topic information is also appended to the stored
-    # memory in a lightweight metadata form.
-    #
-    # --------------------------------------------------------
+    if text.startswith("```"):
+        lines = text.splitlines()
 
-    topics = candidate.get(
-        "topics",
-        []
-    )
+        if lines:
+            lines = lines[1:]
 
-    content = candidate["content"]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
 
-    if topics:
+        text = "\n".join(lines).strip()
 
-        topic_text = ", ".join(
-            topics
-        )
+    return text
 
-        content_for_storage = (
-            f"{content}\n"
-            f"[Topics: {topic_text}]"
-        )
 
-    else:
+def _safe_json(text: str) -> dict:
+    """
+    Parse model JSON safely.
+    """
 
-        content_for_storage = content
+    cleaned = _strip_json_fences(text)
 
     try:
+        value = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Memory analyzer returned invalid JSON: {exc}"
+        ) from exc
 
-        add_or_update_memory(
-            content=content_for_storage,
-            memory_type=candidate["type"],
-            importance=candidate["importance"],
-            source_message_id=source_message_id,
+    if not isinstance(value, dict):
+        raise ValueError(
+            "Memory analyzer JSON must be an object."
         )
 
-    except TypeError:
+    return value
 
-        add_or_update_memory(
-            content_for_storage,
-            candidate["type"],
-            candidate["importance"],
-            source_message_id,
+
+def _normalize_type(value: Any) -> str:
+    """
+    Normalize memory category.
+    """
+
+    value = str(value or "fact").strip().lower()
+
+    if value not in ALLOWED_MEMORY_TYPES:
+        return "fact"
+
+    return value
+
+
+def _normalize_importance(value: Any) -> float:
+    """
+    Clamp importance to 0..5.
+    """
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 2.5
+
+    return max(
+        0.0,
+        min(5.0, number),
+    )
+
+
+def _normalize_confidence(value: Any) -> float:
+    """
+    Clamp confidence to 0..1.
+    """
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+
+    return max(
+        0.0,
+        min(1.0, number),
+    )
+
+
+def _parse_candidates(
+    raw: str,
+) -> list[MemoryCandidate]:
+
+    data = _safe_json(raw)
+
+    memories = data.get(
+        "memories",
+        [],
+    )
+
+    if not isinstance(memories, list):
+        return []
+
+    results: list[MemoryCandidate] = []
+
+    for item in memories:
+        if not isinstance(item, dict):
+            continue
+
+        content = str(
+            item.get("content", "")
+        ).strip()
+
+        if not content:
+            continue
+
+        if len(content) > MAX_MEMORY_LENGTH:
+            content = content[
+                :MAX_MEMORY_LENGTH
+            ].rstrip()
+
+        memory_type = _normalize_type(
+            item.get("memory_type")
         )
+
+        importance = _normalize_importance(
+            item.get("importance")
+        )
+
+        confidence = _normalize_confidence(
+            item.get("confidence")
+        )
+
+        # Low-confidence candidates are discarded here instead
+        # of polluting long-term memory.
+        if confidence < 0.60:
+            continue
+
+        results.append(
+            MemoryCandidate(
+                content=content,
+                memory_type=memory_type,
+                importance=importance,
+                confidence=confidence,
+            )
+        )
+
+        if len(results) >= MAX_MEMORIES_PER_MESSAGE:
+            break
+
+    return results
+
+
+def _parse_action(
+    raw: str,
+    fallback: MemoryCandidate,
+) -> MemoryAction:
+
+    try:
+        data = _safe_json(raw)
+    except ValueError:
+        return MemoryAction(
+            action="new",
+            content=fallback.content,
+            memory_type=fallback.memory_type,
+            importance=fallback.importance,
+        )
+
+    action = str(
+        data.get("action", "new")
+    ).strip().lower()
+
+    if action not in {
+        "duplicate",
+        "replace",
+        "merge",
+        "new",
+    }:
+        action = "new"
+
+    content = str(
+        data.get(
+            "content",
+            fallback.content,
+        )
+    ).strip()
+
+    if not content:
+        content = fallback.content
+
+    content = content[
+        :MAX_MEMORY_LENGTH
+    ].rstrip()
+
+    memory_type = _normalize_type(
+        data.get(
+            "memory_type",
+            fallback.memory_type,
+        )
+    )
+
+    importance = _normalize_importance(
+        data.get(
+            "importance",
+            fallback.importance,
+        )
+    )
+
+    return MemoryAction(
+        action=action,
+        content=content,
+        memory_type=memory_type,
+        importance=importance,
+    )
 
 
 # ============================================================
-# MAIN ENTRY POINT
+# Recent-context handling
+# ============================================================
+
+def _format_recent_context(
+    recent_context: list[dict] | None,
+) -> str:
+
+    if not recent_context:
+        return ""
+
+    lines: list[str] = []
+
+    # Only keep a small local window.
+    for item in recent_context[-8:]:
+
+        if not isinstance(item, dict):
+            continue
+
+        role = str(
+            item.get("role", "")
+        ).strip().lower()
+
+        content = str(
+            item.get("content", "")
+        ).strip()
+
+        if role not in {
+            "user",
+            "assistant",
+        }:
+            continue
+
+        if not content:
+            continue
+
+        lines.append(
+            f"{role.upper()}: {content}"
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# Duplicate detection
+# ============================================================
+
+def _find_related_memory(
+    content: str,
+) -> dict | None:
+    """
+    Find the strongest existing semantic match.
+
+    This uses semantic search directly rather than the public
+    retrieve_memories() function so merely comparing a candidate
+    does NOT increment the memory's access counter.
+    """
+
+    results = semantic_search(
+        content,
+        limit=3,
+    )
+
+    if not results:
+        return None
+
+    best = results[0]
+
+    similarity = float(
+        best.get(
+            "semantic_similarity",
+            0.0,
+        )
+    )
+
+    if similarity < RELATED_MEMORY_THRESHOLD:
+        return None
+
+    from .database import get_memory
+
+    memory = get_memory(
+        int(best["memory_id"])
+    )
+
+    if memory is None:
+        return None
+
+    memory = dict(memory)
+
+    memory["_similarity"] = similarity
+
+    return memory
+
+
+# ============================================================
+# Storage
+# ============================================================
+
+def _store_new_memory(
+    candidate: MemoryCandidate,
+    source_message_id: int | None,
+) -> Any:
+    """
+    Store a new memory and immediately create its semantic
+    embedding so it can participate in future retrieval.
+    """
+
+    result = add_or_update_memory(
+        content=candidate.content,
+        memory_type=candidate.memory_type,
+        importance=candidate.importance,
+        source_message_id=source_message_id,
+    )
+
+    # add_or_update_memory() returns:
+    # (memory_id, created)
+    if isinstance(result, tuple) and result:
+        memory_id = result[0]
+
+        try:
+            embed_memory(
+                int(memory_id),
+                candidate.content,
+            )
+        except Exception as exc:
+            print(
+                f"Warning: failed to embed memory "
+                f"{memory_id}: {exc}"
+            )
+
+    return result
+
+
+def _replace_memory(
+    existing_memory: dict,
+    action: MemoryAction,
+    source_message_id: int | None,
+) -> Any:
+    """
+    Replace an old memory while preserving the old record as
+    archived history.
+
+    This avoids directly manipulating the memories table here.
+    """
+
+    archive_memory(
+        int(existing_memory["id"])
+    )
+
+    candidate = MemoryCandidate(
+        content=action.content,
+        memory_type=action.memory_type,
+        importance=action.importance,
+        confidence=1.0,
+    )
+
+    return _store_new_memory(
+        candidate,
+        source_message_id,
+    )
+
+
+def _merge_memory(
+    existing_memory: dict,
+    action: MemoryAction,
+    source_message_id: int | None,
+) -> Any:
+    """
+    Merge old + new semantic information into one durable
+    memory.
+
+    The old record is archived and the consolidated record is
+    stored as the active memory.
+    """
+
+    archive_memory(
+        int(existing_memory["id"])
+    )
+
+    candidate = MemoryCandidate(
+        content=action.content,
+        memory_type=action.memory_type,
+        importance=action.importance,
+        confidence=1.0,
+    )
+
+    return _store_new_memory(
+        candidate,
+        source_message_id,
+    )
+
+
+# ============================================================
+# Main pipeline
 # ============================================================
 
 def process_message(
-    message,
-    source_message_id=None
-):
-
+    message: str,
+    *,
+    source_message_id: int | None = None,
+    recent_context: list[dict] | None = None,
+    analyzer: MemoryAnalyzer | None = None,
+) -> list[dict]:
     """
-    Analyze one user message and save durable information.
+    Process ONE current user message.
 
-    Returns the memories that were classified and saved.
+    Returns a list describing what the memory system did.
+
+    Example return:
+
+    [
+        {
+            "action": "stored",
+            "memory_id": 12,
+            "content": "...",
+        }
+    ]
+
+    Critical rule:
+
+        This function receives the current user message.
+
+        It does NOT retrieve historical conversation to determine
+        what the user meant.
     """
 
-    message = _normalize(message)
+    if not isinstance(message, str):
+        raise TypeError(
+            "message must be a string"
+        )
+
+    message = message.strip()
 
     if not message:
         return []
 
-    sentences = _split_sentences(
-        message
+    if analyzer is None:
+        analyzer = OllamaMemoryAnalyzer()
+
+    # --------------------------------------------------------
+    # Phase 1:
+    # Determine whether the current user message contains
+    # durable information.
+    # --------------------------------------------------------
+
+    candidates = analyzer.analyze(
+        message,
+        recent_context,
     )
 
-    saved = []
+    if not candidates:
+        return []
 
-    for sentence in sentences:
+    results: list[dict] = []
 
-        candidate = _analyze_sentence(
-            sentence
+    # --------------------------------------------------------
+    # Phase 2:
+    # Handle each candidate independently.
+    # --------------------------------------------------------
+
+    for candidate in candidates:
+
+        existing = _find_related_memory(
+            candidate.content
         )
 
-        if not candidate:
+        # No semantically related memory exists.
+        if existing is None:
+
+            stored = _store_new_memory(
+                candidate,
+                source_message_id,
+            )
+
+            results.append(
+                {
+                    "action": "stored",
+                    "content": candidate.content,
+                    "memory_type": candidate.memory_type,
+                    "importance": candidate.importance,
+                    "result": stored,
+                }
+            )
+
             continue
 
-        _save_candidate(
+        # ----------------------------------------------------
+        # Phase 3:
+        # Related memory exists.
+        #
+        # Ask the analyzer whether this is:
+        #
+        # duplicate / replacement / merge / separate fact
+        # ----------------------------------------------------
+
+        similarity = float(
+    existing.get("_similarity", 0.0)
+)
+
+# Very strong semantic match:
+# don't let the small LLM override the embedding signal.
+        if similarity >= AUTO_DUPLICATE_THRESHOLD:
+            action = MemoryAction(
+                action="duplicate",
+                content=candidate.content,
+                memory_type=candidate.memory_type,
+                importance=candidate.importance,
+            )
+        else:
+            action = analyzer.resolve(
+                candidate,
+                existing,
+            )
+
+        if action.action == "duplicate":
+
+            results.append(
+                {
+                    "action": "duplicate",
+                    "content": candidate.content,
+                    "existing_memory_id": existing["id"],
+                    "similarity": existing.get(
+                        "_similarity",
+                        0.0,
+                    ),
+                }
+            )
+
+            continue
+
+        if action.action == "replace":
+
+            stored = _replace_memory(
+                existing,
+                action,
+                source_message_id,
+            )
+
+            results.append(
+                {
+                    "action": "replaced",
+                    "content": action.content,
+                    "archived_memory_id": existing["id"],
+                    "result": stored,
+                }
+            )
+
+            continue
+
+        if action.action == "merge":
+
+            stored = _merge_memory(
+                existing,
+                action,
+                source_message_id,
+            )
+
+            results.append(
+                {
+                    "action": "merged",
+                    "content": action.content,
+                    "archived_memory_id": existing["id"],
+                    "result": stored,
+                }
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # "new"
+        #
+        # The memories are related, but they contain distinct
+        # durable information.
+        # ----------------------------------------------------
+
+        stored = _store_new_memory(
             candidate,
-            source_message_id
+            source_message_id,
         )
 
-        saved.append(
-            candidate
+        results.append(
+            {
+                "action": "stored_related",
+                "content": candidate.content,
+                "related_memory_id": existing["id"],
+                "similarity": existing.get(
+                    "_similarity",
+                    0.0,
+                ),
+                "result": stored,
+            }
         )
 
-    return saved
+    return results
+
+
+# ============================================================
+# Diagnostics
+# ============================================================
+
+def get_manager_info() -> dict:
+    """
+    Configuration information for debugging.
+    """
+
+    return {
+        "ollama_url": OLLAMA_URL,
+        "ollama_model": OLLAMA_MODEL,
+        "related_memory_threshold": (
+            RELATED_MEMORY_THRESHOLD
+        ),
+        "max_memories_per_message": (
+            MAX_MEMORIES_PER_MESSAGE
+        ),
+        "max_memory_length": (
+            MAX_MEMORY_LENGTH
+        ),
+        "allowed_memory_types": sorted(
+            ALLOWED_MEMORY_TYPES
+        ),
+    }
+
+
+# ============================================================
+# Self-test
+# ============================================================
+
+class _MockAnalyzer:
+    """
+    Deterministic analyzer for testing the manager without
+    launching Ollama.
+    """
+
+    def analyze(
+        self,
+        message: str,
+        recent_context: list[dict] | None = None,
+    ) -> list[MemoryCandidate]:
+
+        if message == "STORE_TEST":
+            return [
+                MemoryCandidate(
+                    content=(
+                        "The user is testing the "
+                        "Ultron memory manager."
+                    ),
+                    memory_type="technical",
+                    importance=3.0,
+                    confidence=1.0,
+                )
+            ]
+
+        return []
+
+    def resolve(
+        self,
+        candidate: MemoryCandidate,
+        existing_memory: dict,
+    ) -> MemoryAction:
+
+        return MemoryAction(
+            action="duplicate",
+            content=candidate.content,
+            memory_type=candidate.memory_type,
+            importance=candidate.importance,
+        )
+
+
+def self_test() -> None:
+    """
+    Test the manager's logic without writing anything to the
+    real database and without starting Ollama.
+    """
+
+    print("Memory manager self-test starting...")
+
+    # --------------------------------------------------------
+    # Candidate parsing
+    # --------------------------------------------------------
+
+    raw = """
+    {
+        "memories": [
+            {
+                "content": "The user uses Python.",
+                "memory_type": "technical",
+                "importance": 4,
+                "confidence": 0.95
+            }
+        ]
+    }
+    """
+
+    candidates = _parse_candidates(raw)
+
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "Candidate parsing failed."
+        )
+
+    candidate = candidates[0]
+
+    if candidate.content != "The user uses Python.":
+        raise RuntimeError(
+            "Candidate content parsing failed."
+        )
+
+    if candidate.memory_type != "technical":
+        raise RuntimeError(
+            "Candidate type parsing failed."
+        )
+
+    # --------------------------------------------------------
+    # Importance/confidence clamping
+    # --------------------------------------------------------
+
+    if _normalize_importance(999) != 5.0:
+        raise RuntimeError(
+            "Importance clamp failed."
+        )
+
+    if _normalize_confidence(-10) != 0.0:
+        raise RuntimeError(
+            "Confidence clamp failed."
+        )
+
+    # --------------------------------------------------------
+    # Context formatting
+    # --------------------------------------------------------
+
+    context = _format_recent_context(
+        [
+            {
+                "role": "user",
+                "content": "I am working on Ultron.",
+            },
+            {
+                "role": "assistant",
+                "content": "Understood.",
+            },
+        ]
+    )
+
+    if "I am working on Ultron." not in context:
+        raise RuntimeError(
+            "Recent-context formatting failed."
+        )
+
+    # --------------------------------------------------------
+    # Mock analyzer
+    # --------------------------------------------------------
+
+    analyzer = _MockAnalyzer()
+
+    results = analyzer.analyze(
+        "STORE_TEST"
+    )
+
+    if len(results) != 1:
+        raise RuntimeError(
+            "Mock analyzer failed."
+        )
+
+    action = analyzer.resolve(
+        results[0],
+        {
+            "id": 1,
+            "content": (
+                "The user is testing the "
+                "Ultron memory manager."
+            ),
+        },
+    )
+
+    if action.action != "duplicate":
+        raise RuntimeError(
+            "Mock resolution failed."
+        )
+
+    # --------------------------------------------------------
+    # Configuration check
+    # --------------------------------------------------------
+
+    info = get_manager_info()
+
+    if not info["ollama_model"]:
+        raise RuntimeError(
+            "Ollama model configuration is empty."
+        )
+
+    print("Memory manager self-test passed.")
+
+
+# ============================================================
+# Command-line entry point
+# ============================================================
+
+if __name__ == "__main__":
+    self_test()

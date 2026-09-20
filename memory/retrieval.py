@@ -1,610 +1,810 @@
-from .database import get_connection
+"""
+Ultron hybrid memory retrieval.
 
+Combines:
+
+    1. SQLite FTS5 lexical retrieval
+    2. MiniLM semantic similarity
+    3. Memory importance
+    4. Recency
+    5. Access frequency
+
+Important design rule:
+
+    Retrieval only evaluates the CURRENT query.
+
+It must never decide what the user meant by searching old chat
+messages. Historical conversation is storage, not intent.
+"""
+
+from __future__ import annotations
+
+import math
 import re
-import unicodedata
+import sqlite3
+from datetime import datetime, timezone
+from typing import Any
+
+import numpy as np
+
+from .database import (
+    get_connection,
+    get_memory,
+    get_active_memory_embeddings,
+    mark_memory_accessed,
+)
+from .embeddings import (
+    MODEL_NAME,
+    encode,
+    cosine_similarity,
+)
 
 
 # ============================================================
-# CONFIGURATION
+# Configuration
 # ============================================================
 
-MAX_QUERY_TERMS = 10
+# Weighting for the final hybrid score.
+#
+# Semantic similarity is the strongest signal because it handles
+# paraphrases and concepts that do not share exact words.
+SEMANTIC_WEIGHT = 0.55
 
-DEFAULT_MEMORY_LIMIT = 6
-DEFAULT_CONVERSATION_LIMIT = 4
-DEFAULT_RECENT_LIMIT = 6
+# Exact/keyword matching remains important for things like:
+# Qwen2.5-Coder, filenames, hardware names, etc.
+LEXICAL_WEIGHT = 0.30
 
-# Messages within this period are considered part of the
-# same active conversation session.
-SESSION_GAP_MINUTES = 45
+# User explicitly marking something important should matter,
+# but should not overpower relevance.
+IMPORTANCE_WEIGHT = 0.10
 
+# Small metadata signals.
+RECENCY_WEIGHT = 0.03
+ACCESS_WEIGHT = 0.02
 
-# ============================================================
-# STOPWORDS
-# ============================================================
+# Scores below this are normally not useful enough to inject
+# into the model's context unless there is a direct lexical hit.
+MINIMUM_SCORE = 0.28
 
-STOPWORDS = {
-    "a", "about", "after", "again", "all", "also", "am", "an",
-    "and", "any", "are", "as", "at", "be", "because", "been",
-    "before", "being", "but", "by", "can", "could", "did", "do",
-    "does", "doing", "for", "from", "had", "has", "have", "he",
-    "her", "here", "hers", "him", "his", "how", "i", "if", "in",
-    "into", "is", "it", "its", "just", "me", "more", "most", "my",
-    "no", "not", "of", "on", "or", "our", "ours", "out", "over",
-    "same", "she", "so", "some", "than", "that", "the", "their",
-    "theirs", "them", "then", "there", "these", "they", "this",
-    "those", "to", "too", "us", "very", "was", "we", "were", "what",
-    "when", "where", "which", "who", "why", "will", "with", "would",
-    "you", "your", "yours",
-}
+# Limit how many memories are returned to the model.
+DEFAULT_LIMIT = 8
 
-
-LOW_INFORMATION_PHRASES = {
-    "hi",
-    "hello",
-    "hey",
-    "yo",
-    "sup",
-    "good morning",
-    "good afternoon",
-    "good evening",
-    "thanks",
-    "thank you",
-    "ok",
-    "okay",
-    "cool",
-    "nice",
-    "lol",
-    "lmao",
-}
+# Recency half-life.
+#
+# After 30 days, the recency component is approximately half
+# of what it would be for a brand-new memory.
+RECENCY_HALF_LIFE_DAYS = 30.0
 
 
 # ============================================================
-# TEXT NORMALIZATION
+# Utility functions
 # ============================================================
 
-def _normalize_text(text):
-
-    if not text:
-        return ""
-
-    return unicodedata.normalize(
-        "NFKC",
-        str(text)
-    ).strip()
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-# ============================================================
-# QUERY TERMS
-# ============================================================
+def _parse_timestamp(value: str | None) -> datetime | None:
+    """
+    Parse an SQLite timestamp safely.
 
-def _extract_terms(text):
+    Supports ISO timestamps with or without timezone information.
+    """
 
-    text = _normalize_text(text).lower()
-
-    raw_words = re.findall(
-        r"[a-z0-9_]{3,}",
-        text
-    )
-
-    terms = []
-    seen = set()
-
-    for word in raw_words:
-
-        if word in STOPWORDS:
-            continue
-
-        if word in seen:
-            continue
-
-        seen.add(word)
-        terms.append(word)
-
-    return terms[:MAX_QUERY_TERMS]
-
-
-def _fts_query(text):
-
-    terms = _extract_terms(text)
-
-    if not terms:
+    if not value:
         return None
 
+    try:
+        text = value.strip()
+
+        # SQLite may store timestamps ending with Z.
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+
+        parsed = datetime.fromisoformat(text)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(timezone.utc)
+
+    except (ValueError, TypeError):
+        return None
+
+
+def _recency_score(timestamp: str | None) -> float:
+    """
+    Convert age into a 0..1 recency score.
+
+    Newer memory -> closer to 1
+    Older memory -> closer to 0
+    """
+
+    created = _parse_timestamp(timestamp)
+
+    if created is None:
+        return 0.0
+
+    age_seconds = max(
+        0.0,
+        (_utc_now() - created).total_seconds(),
+    )
+
+    age_days = age_seconds / 86400.0
+
+    return math.pow(
+        0.5,
+        age_days / RECENCY_HALF_LIFE_DAYS,
+    )
+
+
+def _importance_score(value: Any) -> float:
+    """
+    Convert database importance (0..5) into 0..1.
+    """
+
+    try:
+        importance = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+    importance = max(0.0, min(5.0, importance))
+
+    return importance / 5.0
+
+
+def _access_score(value: Any) -> float:
+    """
+    Convert access count into a bounded 0..1 signal.
+
+    log1p prevents frequently accessed memories from completely
+    dominating newer/relevant memories.
+    """
+
+    try:
+        count = max(0, int(value))
+    except (TypeError, ValueError):
+        count = 0
+
+    # 1 + log1p(9) ≈ 3.3, so normalize around 10 accesses.
+    return min(
+        1.0,
+        math.log1p(count) / math.log1p(10),
+    )
+
+
+# ============================================================
+# FTS5 query handling
+# ============================================================
+
+def _extract_search_terms(query: str) -> list[str]:
+    """
+    Extract safe searchable terms from a natural-language query.
+
+    We do this instead of sending raw user text directly into
+    FTS5, because FTS5 interprets characters such as:
+
+        AND
+        OR
+        NOT
+        *
+        "
+
+    as query syntax.
+    """
+
+    if not isinstance(query, str):
+        raise TypeError("query must be a string")
+
+    # Unicode-aware word extraction.
+    terms = re.findall(r"[\w]+", query, flags=re.UNICODE)
+
+    # Remove duplicates while preserving order.
+    seen: set[str] = set()
+    result: list[str] = []
+
+    for term in terms:
+        term = term.strip()
+
+        if not term:
+            continue
+
+        normalized = term.casefold()
+
+        if normalized in seen:
+            continue
+
+        seen.add(normalized)
+        result.append(term)
+
+    return result
+
+
+def _build_fts_query(query: str) -> str:
+    """
+    Convert normal user text into a safe FTS5 OR query.
+    """
+
+    terms = _extract_search_terms(query)
+
+    if not terms:
+        return ""
+
+    # Each term is quoted so FTS5 treats it as literal text.
     return " OR ".join(
-        f'"{term}"'
+        f'"{term.replace(chr(34), chr(34) * 2)}"'
         for term in terms
     )
 
 
 # ============================================================
-# MEMORY TOPIC DETECTION
+# Lexical retrieval
 # ============================================================
 
-def find_memory_topics(
-    query,
-    limit=DEFAULT_MEMORY_LIMIT
-):
+def lexical_search(
+    query: str,
+    *,
+    limit: int = DEFAULT_LIMIT,
+) -> list[dict]:
     """
-    Determine whether the user's message actually overlaps
-    with topics currently stored in long-term memory.
+    Search active memories with SQLite FTS5.
 
-    This is intentionally different from simply searching
-    memories and accepting whatever FTS happens to return.
+    Returns:
 
-    A query such as:
+        memory_id
+        bm25
+        lexical_rank
 
-        "hi ultron"
-
-    should not cause unrelated memories to be retrieved.
-
-    A query such as:
-
-        "what happened with my Python project?"
-
-    can retrieve memories containing Python/project-related
-    information.
+    Lower BM25 values are better in SQLite FTS5.
+    We convert the ordering into a simple 0..1 rank score.
     """
 
-    terms = _extract_terms(query)
-
-    if not terms:
+    if limit <= 0:
         return []
 
+    fts_query = _build_fts_query(query)
 
-    # --------------------------------------------------------
-    # SEARCH FOR TOPIC OVERLAP
-    # --------------------------------------------------------
-
-    fts = _fts_query(query)
-
-    if not fts:
+    if not fts_query:
         return []
-
-
-    limit = max(
-        1,
-        min(int(limit), 50)
-    )
 
     conn = get_connection()
 
     try:
-
         rows = conn.execute(
             """
             SELECT
-                m.id,
-                m.content,
-                m.memory_type,
-                m.importance,
-                m.last_accessed,
-                m.access_count,
-                memories_fts.rank AS relevance
-
+                rowid AS memory_id,
+                bm25(memories_fts) AS bm25_score
             FROM memories_fts
-
-            JOIN memories AS m
-                ON m.id = memories_fts.rowid
-
+            JOIN memories
+                ON memories.id = memories_fts.rowid
             WHERE memories_fts MATCH ?
-              AND m.active = 1
-
-            ORDER BY
-                memories_fts.rank ASC,
-                m.importance DESC,
-                m.access_count DESC
-
+              AND memories.active = 1
+            ORDER BY bm25_score ASC
             LIMIT ?
             """,
-            (
-                fts,
-                limit
-            )
+            (fts_query, limit),
         ).fetchall()
 
-
-        results = [
-            dict(row)
-            for row in rows
-        ]
-
-
-        # ----------------------------------------------------
-        # REQUIRE ACTUAL TOPIC OVERLAP
-        # ----------------------------------------------------
-
-        # FTS already performed the broad matching.
-        # We now make sure at least one meaningful query
-        # term is actually present in the memory text.
-
-        verified = []
-
-        for memory in results:
-
-            memory_text = _normalize_text(
-                memory["content"]
-            ).lower()
-
-            matched_terms = [
-                term
-                for term in terms
-                if term in memory_text
-            ]
-
-            if not matched_terms:
-                continue
-
-            memory["matched_terms"] = matched_terms
-
-            verified.append(
-                memory
-            )
-
-
-        return verified
+    except sqlite3.OperationalError:
+        # Invalid/unusable FTS query should not crash Ultron.
+        return []
 
     finally:
-
         conn.close()
 
+    results: list[dict] = []
 
-def has_memory_topic(query):
-    """
-    Return True only when the query appears to reference
-    something that actually exists in long-term memory.
-    """
+    total = len(rows)
 
-    return bool(
-        find_memory_topics(
-            query,
-            limit=1
+    for index, row in enumerate(rows):
+        # Best result gets 1.0.
+        #
+        # Example:
+        #   1 result -> 1.0
+        #   2 results -> 1.0, 0.5
+        #   5 results -> 1.0, .8, .6, .4, .2
+        lexical_rank = (
+            1.0
+            if total == 1
+            else 1.0 - (index / total)
         )
-    )
 
-
-# ============================================================
-# MESSAGE IMPORTANCE FOR RETRIEVAL
-# ============================================================
-
-def is_low_information_message(text):
-
-    """
-    Detect messages where searching historical conversation
-    is more likely to create noise than useful context.
-    """
-
-    normalized = _normalize_text(
-        text
-    ).lower()
-
-    if not normalized:
-        return True
-
-    if normalized in LOW_INFORMATION_PHRASES:
-        return True
-
-    terms = _extract_terms(
-        normalized
-    )
-
-    # Very short conversational messages.
-    if len(terms) <= 1:
-        return True
-
-    return False
-
-
-def should_search_old_conversation(text):
-
-    """
-    Historical conversation search should be selective.
-
-    Greetings, acknowledgements, and tiny casual messages should
-    not search the entire lifetime of the database.
-    """
-
-    if is_low_information_message(text):
-        return False
-
-    terms = _extract_terms(
-        text
-    )
-
-    return len(terms) >= 2
-
-
-# ============================================================
-# SEARCH LONG-TERM MEMORIES
-# ============================================================
-
-def search_memories(
-    query,
-    limit=DEFAULT_MEMORY_LIMIT
-):
-
-    """
-    Search long-term memories only when the query has
-    meaningful overlap with stored memory topics.
-    """
-
-    return find_memory_topics(
-        query,
-        limit=limit
-    )
-
-
-# ============================================================
-# SEARCH OLD CONVERSATIONS
-# ============================================================
-
-def search_conversation(
-    query,
-    limit=DEFAULT_CONVERSATION_LIMIT
-):
-
-    if not should_search_old_conversation(query):
-        return []
-
-    fts = _fts_query(query)
-
-    if not fts:
-        return []
-
-    limit = max(
-        1,
-        min(int(limit), 50)
-    )
-
-    conn = get_connection()
-
-    try:
-
-        rows = conn.execute(
-            """
-            SELECT
-                m.id,
-                m.role,
-                m.content,
-                m.created_at,
-                messages_fts.rank AS relevance
-
-            FROM messages_fts
-
-            JOIN messages AS m
-                ON m.id = messages_fts.rowid
-
-            WHERE messages_fts MATCH ?
-
-            ORDER BY
-                messages_fts.rank ASC
-
-            LIMIT ?
-            """,
-            (
-                fts,
-                limit
-            )
-        ).fetchall()
-
-        return [
-            dict(row)
-            for row in rows
-        ]
-
-    finally:
-
-        conn.close()
-
-
-# ============================================================
-# RECENT SESSION
-# ============================================================
-
-def get_recent_messages(
-    limit=DEFAULT_RECENT_LIMIT,
-    session_minutes=SESSION_GAP_MINUTES
-):
-
-    limit = max(
-        1,
-        min(int(limit), 50)
-    )
-
-    session_minutes = max(
-        1,
-        int(session_minutes)
-    )
-
-    conn = get_connection()
-
-    try:
-
-        rows = conn.execute(
-            """
-            SELECT
-                role,
-                content,
-                created_at
-
-            FROM messages
-
-            WHERE created_at >= datetime(
-                'now',
-                ?
-            )
-
-            ORDER BY id ASC
-
-            LIMIT ?
-            """,
-            (
-                f"-{session_minutes} minutes",
-                limit
-            )
-        ).fetchall()
-
-        return [
+        results.append(
             {
-                "role": row["role"],
-                "content": row["content"],
-                "created_at": row["created_at"],
+                "memory_id": int(row["memory_id"]),
+                "bm25_score": float(row["bm25_score"]),
+                "lexical_score": lexical_rank,
             }
-            for row in rows
-        ]
+        )
 
-    finally:
-
-        conn.close()
+    return results
 
 
 # ============================================================
-# LAST MESSAGE
+# Semantic retrieval
 # ============================================================
 
-def get_last_message():
+def semantic_search(
+    query: str,
+    *,
+    limit: int = DEFAULT_LIMIT,
+) -> list[dict]:
+    """
+    Search all active memory embeddings using MiniLM.
 
-    conn = get_connection()
+    The current database is small enough that scanning active
+    memory embeddings is perfectly reasonable.
 
-    try:
+    This can later be optimized with an approximate nearest
+    neighbor index if the memory collection becomes very large.
+    """
 
-        row = conn.execute(
-            """
-            SELECT
-                id,
-                role,
-                content,
-                created_at
+    if limit <= 0:
+        return []
 
-            FROM messages
+    query_embedding = encode(query)
 
-            ORDER BY id DESC
-
-            LIMIT 1
-            """
-        ).fetchone()
-
-        if not row:
-            return None
-
-        return dict(row)
-
-    finally:
-
-        conn.close()
-
-
-# ============================================================
-# TOUCH ACCESSED MEMORIES
-# ============================================================
-
-def touch_memories(ids):
-
-    if not ids:
-        return
-
-    unique_ids = list(
-        dict.fromkeys(ids)
+    stored_embeddings = get_active_memory_embeddings(
+        model=MODEL_NAME,
     )
 
-    conn = get_connection()
+    results: list[dict] = []
 
-    try:
+    for row in stored_embeddings:
+        memory_id = int(row["memory_id"])
+        embedding = row["embedding"]
 
-        conn.executemany(
-            """
-            UPDATE memories
-
-            SET
-                last_accessed = CURRENT_TIMESTAMP,
-                access_count = access_count + 1
-
-            WHERE id = ?
-            """,
-            [
-                (memory_id,)
-                for memory_id in unique_ids
-            ]
+        similarity = cosine_similarity(
+            query_embedding,
+            embedding,
         )
 
-        conn.commit()
-
-    finally:
-
-        conn.close()
-
-
-# ============================================================
-# DATABASE COUNTS
-# ============================================================
-
-def get_counts():
-
-    conn = get_connection()
-
-    try:
-
-        messages = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM messages
-            """
-        ).fetchone()[0]
-
-        memories = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM memories
-            WHERE active = 1
-            """
-        ).fetchone()[0]
-
-        return (
-            messages,
-            memories
+        results.append(
+            {
+                "memory_id": memory_id,
+                "semantic_similarity": float(similarity),
+            }
         )
 
-    finally:
+    results.sort(
+        key=lambda item: item["semantic_similarity"],
+        reverse=True,
+    )
 
-        conn.close()
+    return results[:limit]
 
 
 # ============================================================
-# COMBINED RETRIEVAL
+# Hybrid ranking
 # ============================================================
 
-def retrieve_context(
-    query,
-    memory_limit=DEFAULT_MEMORY_LIMIT,
-    conversation_limit=DEFAULT_CONVERSATION_LIMIT,
-    recent_limit=DEFAULT_RECENT_LIMIT
-):
+def _normalize_semantic_score(similarity: float) -> float:
+    """
+    Convert cosine similarity from approximately [-1, 1]
+    into [0, 1].
 
-    memories = search_memories(
+    We also clamp because numerical/model behavior should never
+    produce a score outside the expected range.
+    """
+
+    score = (similarity + 1.0) / 2.0
+
+    return max(
+        0.0,
+        min(1.0, score),
+    )
+
+
+def _merge_candidates(
+    lexical_results: list[dict],
+    semantic_results: list[dict],
+) -> dict[int, dict]:
+    """
+    Merge lexical and semantic candidate sets by memory ID.
+    """
+
+    candidates: dict[int, dict] = {}
+
+    for result in lexical_results:
+        memory_id = int(result["memory_id"])
+
+        candidate = candidates.setdefault(
+            memory_id,
+            {
+                "memory_id": memory_id,
+                "lexical_score": 0.0,
+                "semantic_similarity": 0.0,
+            },
+        )
+
+        candidate["lexical_score"] = max(
+            candidate["lexical_score"],
+            float(result["lexical_score"]),
+        )
+
+        candidate["bm25_score"] = result.get(
+            "bm25_score"
+        )
+
+    for result in semantic_results:
+        memory_id = int(result["memory_id"])
+
+        candidate = candidates.setdefault(
+            memory_id,
+            {
+                "memory_id": memory_id,
+                "lexical_score": 0.0,
+                "semantic_similarity": 0.0,
+            },
+        )
+
+        candidate["semantic_similarity"] = max(
+            candidate["semantic_similarity"],
+            float(result["semantic_similarity"]),
+        )
+
+    return candidates
+
+
+def _build_hybrid_result(
+    candidate: dict,
+    memory: dict,
+) -> dict:
+    """
+    Calculate the final hybrid score for one memory.
+    """
+
+    semantic_similarity = float(
+        candidate.get(
+            "semantic_similarity",
+            0.0,
+        )
+    )
+
+    semantic_score = _normalize_semantic_score(
+        semantic_similarity
+    )
+
+    lexical_score = float(
+        candidate.get(
+            "lexical_score",
+            0.0,
+        )
+    )
+
+    importance_score = _importance_score(
+        memory.get("importance")
+    )
+
+    recency_score = _recency_score(
+        memory.get("updated_at")
+        or memory.get("created_at")
+    )
+
+    access_score = _access_score(
+        memory.get("access_count")
+    )
+
+    final_score = (
+        semantic_score * SEMANTIC_WEIGHT
+        + lexical_score * LEXICAL_WEIGHT
+        + importance_score * IMPORTANCE_WEIGHT
+        + recency_score * RECENCY_WEIGHT
+        + access_score * ACCESS_WEIGHT
+    )
+
+    result = dict(memory)
+
+    result.update(
+        {
+            "semantic_similarity": semantic_similarity,
+            "semantic_score": semantic_score,
+            "lexical_score": lexical_score,
+            "importance_score": importance_score,
+            "recency_score": recency_score,
+            "access_score": access_score,
+            "hybrid_score": final_score,
+        }
+    )
+
+    return result
+
+
+# ============================================================
+# Public retrieval API
+# ============================================================
+
+def retrieve_memories(
+    query: str,
+    *,
+    limit: int = DEFAULT_LIMIT,
+    candidate_limit: int | None = None,
+    minimum_score: float = MINIMUM_SCORE,
+) -> list[dict]:
+    """
+    Retrieve memories relevant to the CURRENT user query.
+
+    This is the main function the rest of Ultron should call.
+
+    Important:
+
+        query should be the user's current message.
+
+    Do NOT pass the entire conversation history here.
+    """
+
+    if not isinstance(query, str):
+        raise TypeError("query must be a string")
+
+    query = query.strip()
+
+    if not query:
+        return []
+
+    if limit <= 0:
+        return []
+
+    if candidate_limit is None:
+        candidate_limit = max(
+            limit * 3,
+            12,
+        )
+
+    # --------------------------------------------------------
+    # Retrieve using both systems.
+    # --------------------------------------------------------
+
+    lexical_results = lexical_search(
         query,
-        limit=memory_limit
+        limit=candidate_limit,
     )
 
-    conversation = search_conversation(
+    semantic_results = semantic_search(
         query,
-        limit=conversation_limit
+        limit=candidate_limit,
     )
 
-    recent = get_recent_messages(
-        limit=recent_limit
+    candidates = _merge_candidates(
+        lexical_results,
+        semantic_results,
     )
 
-    if memories:
+    if not candidates:
+        return []
 
-        touch_memories(
-            [
-                memory["id"]
-                for memory in memories
-            ]
+    # --------------------------------------------------------
+    # Load full memory records.
+    # --------------------------------------------------------
+
+    ranked: list[dict] = []
+
+    for candidate in candidates.values():
+        memory = get_memory(
+            candidate["memory_id"]
         )
+
+        if memory is None:
+            continue
+
+        if not bool(memory.get("active", 0)):
+            continue
+
+        result = _build_hybrid_result(
+            candidate,
+            memory,
+        )
+
+        # A direct lexical hit gets some protection from an
+        # unusually weak semantic score.
+        direct_lexical_hit = (
+            result["lexical_score"] > 0.0
+        )
+
+        if (
+            result["hybrid_score"] >= minimum_score
+            or direct_lexical_hit
+        ):
+            ranked.append(result)
+
+    # --------------------------------------------------------
+    # Final ordering.
+    # --------------------------------------------------------
+
+    ranked.sort(
+        key=lambda item: item["hybrid_score"],
+        reverse=True,
+    )
+
+    ranked = ranked[:limit]
+
+    # --------------------------------------------------------
+    # Access tracking.
+    #
+    # Only mark memories that actually survived retrieval.
+    # Merely existing in the database does not count as access.
+    # --------------------------------------------------------
+
+    for result in ranked:
+        try:
+            mark_memory_accessed(
+                result["id"]
+            )
+        except Exception:
+            # Retrieval should never fail just because access
+            # tracking encountered a database issue.
+            pass
+
+    return ranked
+
+
+# ============================================================
+# Context formatting
+# ============================================================
+
+def format_memories_for_context(
+    memories: list[dict],
+) -> str:
+    """
+    Convert retrieved memories into compact context for the LLM.
+
+    The model receives the memory content and a small amount of
+    metadata, but NOT the internal embedding vectors.
+    """
+
+    if not memories:
+        return ""
+
+    sections: list[str] = []
+
+    for memory in memories:
+        content = str(
+            memory.get("content", "")
+        ).strip()
+
+        if not content:
+            continue
+
+        memory_type = str(
+            memory.get(
+                "memory_type",
+                "unknown",
+            )
+        )
+
+        sections.append(
+            f"- [{memory_type}] {content}"
+        )
+
+    if not sections:
+        return ""
+
+    return "\n".join(sections)
+
+
+# ============================================================
+# Diagnostics
+# ============================================================
+
+def get_retrieval_info() -> dict:
+    """
+    Return configuration information useful for debugging.
+    """
 
     return {
-        "memories": memories,
-        "conversation": conversation,
-        "recent": recent,
+        "embedding_model": MODEL_NAME,
+        "semantic_weight": SEMANTIC_WEIGHT,
+        "lexical_weight": LEXICAL_WEIGHT,
+        "importance_weight": IMPORTANCE_WEIGHT,
+        "recency_weight": RECENCY_WEIGHT,
+        "access_weight": ACCESS_WEIGHT,
+        "minimum_score": MINIMUM_SCORE,
+        "default_limit": DEFAULT_LIMIT,
+        "recency_half_life_days": RECENCY_HALF_LIFE_DAYS,
     }
+
+
+def self_test() -> None:
+    """
+    Basic retrieval-layer test.
+
+    The test deliberately does NOT create permanent memories.
+    """
+
+    print("Retrieval self-test starting...")
+
+    # --------------------------------------------------------
+    # Test query processing.
+    # --------------------------------------------------------
+
+    query = (
+        "What coding model did I use for Python?"
+    )
+
+    terms = _extract_search_terms(query)
+    fts_query = _build_fts_query(query)
+
+    if not terms:
+        raise RuntimeError(
+            "Search term extraction failed."
+        )
+
+    if not fts_query:
+        raise RuntimeError(
+            "FTS query construction failed."
+        )
+
+    print(f"SEARCH TERMS: {terms}")
+    print(f"FTS QUERY: {fts_query}")
+
+    # --------------------------------------------------------
+    # Test metadata scoring.
+    # --------------------------------------------------------
+
+    if not 0.0 <= _importance_score(5) <= 1.0:
+        raise RuntimeError(
+            "Importance scoring failed."
+        )
+
+    if not 0.0 <= _access_score(10) <= 1.0:
+        raise RuntimeError(
+            "Access scoring failed."
+        )
+
+    recency = _recency_score(
+        _utc_now().isoformat()
+    )
+
+    if not 0.9 <= recency <= 1.0:
+        raise RuntimeError(
+            "Recency scoring failed."
+        )
+
+    # --------------------------------------------------------
+    # Test database retrieval against the current database.
+    #
+    # It is currently expected to be empty after our cleanup,
+    # so this verifies that an empty memory store behaves safely.
+    # --------------------------------------------------------
+
+    results = retrieve_memories(
+        "Ultron memory retrieval test"
+    )
+
+    print(
+        f"ACTIVE MEMORY RESULTS: {len(results)}"
+    )
+
+    # --------------------------------------------------------
+    # Test context formatting.
+    # --------------------------------------------------------
+
+    sample = [
+        {
+            "content": "Ultron uses semantic memory.",
+            "memory_type": "fact",
+        },
+        {
+            "content": "MiniLM provides embeddings.",
+            "memory_type": "technical",
+        },
+    ]
+
+    context = format_memories_for_context(
+        sample
+    )
+
+    if "Ultron uses semantic memory." not in context:
+        raise RuntimeError(
+            "Context formatting failed."
+        )
+
+    print("Retrieval self-test passed.")
+
+
+# ============================================================
+# Command-line entry point
+# ============================================================
+
+if __name__ == "__main__":
+    self_test()
