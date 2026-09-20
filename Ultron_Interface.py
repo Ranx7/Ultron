@@ -1,6 +1,8 @@
 from flask import Flask, render_template, request, jsonify, Response
 from ollama import Client
 from pathlib import Path
+import json
+import threading
 
 from memory.database import (
     initialize_database,
@@ -57,15 +59,17 @@ ULTRON_SYSTEM = """
 You are Ultron, the user's local AI assistant.
 
 Persistent system facts:
+
 - Your assistant name is Ultron.
 - You run locally through Ollama on the user's computer.
-- Your underlying model is Llama 3.2 3B Q4.
+- Your underlying model is Qwen3 1.7B.
 - You are accessed through a local Flask web interface.
 - The application has a persistent SQLite memory database.
 - The database stores conversation history and extracted long-term memories.
 - The user has explicitly told you that their name is Randy.
 
 The application also has a /code command.
+
 When /code is used, the application can provide you with the actual
 source code of authorized Python files from your local project.
 
@@ -88,10 +92,11 @@ IMPORTANT CONVERSATION RULES:
     something that does not appear in the supplied context.
 
 When source code is supplied through /code:
+
 - Treat the supplied source as real source code from the local application.
 - Analyze only the source that is actually supplied.
 - Do not pretend the code is fictional.
-- Distinguish the Llama model from the Python application that controls
+- Distinguish the Qwen3 model from the Python application that controls
   its interface.
 
 Do not claim that these facts are fictional or that this system is a cloud chat.
@@ -100,19 +105,27 @@ Do not claim to be ChatGPT.
 You can be conversational and humorous, but follow the rules above.
 
 TIMESTAMP RULES:
+
 - The application/database is the only source of timestamps.
 - Never invent, estimate, or calculate a timestamp.
-- Never output a [Timestamp: ...] label unless the application explicitly provides that timestamp.
-- Never claim something happened earlier, recently, today, or at a specific time unless the supplied conversation data proves it.
+- Never output a [Timestamp: ...] label unless the application explicitly
+  provides that timestamp.
+- Never claim something happened earlier, recently, today, or at a
+  specific time unless the supplied conversation data proves it.
 
 CONVERSATION MEMORY RULES:
+
 - Retrieved conversation snippets are evidence, not assumptions.
-- Never claim the user previously said something unless that exact topic or statement appears in the supplied conversation.
-- If you cannot find evidence for a claimed previous conversation, say you do not have evidence of it.
+- Never claim the user previously said something unless that exact topic
+  or statement appears in the supplied conversation.
+- If you cannot find evidence for a claimed previous conversation,
+  say you do not have evidence of it.
 - Do not invent missing conversation history.
-- Do not interpret a normal conversational statement as a memory lookup unless the user clearly asks about the past.
+- Do not interpret a normal conversational statement as a memory lookup
+  unless the user clearly asks about the past.
 
 CODE INSPECTION RULES:
+
 - The supplied source code is authoritative.
 - Analyze only the source code actually provided to you.
 - Never invent source code.
@@ -121,7 +134,8 @@ CODE INSPECTION RULES:
 - If asked to reproduce code, reproduce the supplied code exactly.
 - If something cannot be found in the supplied source, say:
   "I cannot find that in the supplied source."
-- Do not fabricate imports, functions, classes, routes, variables, or implementations.
+- Do not fabricate imports, functions, classes, routes, variables,
+  or implementations.
 """.strip()
 
 
@@ -264,7 +278,6 @@ def build_context(user_message):
         user_message
     )
 
-
     # --------------------------------------------------------
     # LONG-TERM MEMORY
     # --------------------------------------------------------
@@ -302,7 +315,6 @@ def build_context(user_message):
                 }
             )
 
-
         # ----------------------------------------------------
         # RELEVANT OLD CONVERSATION
         # ----------------------------------------------------
@@ -335,7 +347,6 @@ def build_context(user_message):
                 }
             )
 
-
     # --------------------------------------------------------
     # RECENT CONVERSATION
     # --------------------------------------------------------
@@ -346,6 +357,7 @@ def build_context(user_message):
 
     # Greetings and other simple social messages don't need
     # previous conversation injected into the prompt.
+
     if normalized_message not in SIMPLE_MESSAGES:
 
         recent = get_recent_messages(
@@ -380,7 +392,6 @@ def build_context(user_message):
             context.extend(
                 recent_context
             )
-
 
     # --------------------------------------------------------
     # CURRENT MESSAGE
@@ -421,6 +432,7 @@ You are now performing a self-inspection of your own software.
 The source code supplied below is authoritative.
 
 Rules:
+
 - Analyze only the code that is actually provided.
 - Do not invent functions, variables, files, or behavior.
 - Explain relationships between components only when supported
@@ -459,12 +471,78 @@ def stream_model(context):
 
     for chunk in stream:
 
-        text = chunk.message.content
+        # ----------------------------------------------------
+        # RAW QWEN3 THINKING
+        # ----------------------------------------------------
 
-        if not text:
-            continue
+        thinking = getattr(
+            chunk.message,
+            "thinking",
+            None
+        )
 
-        yield text
+        if thinking:
+
+            yield {
+                "type": "thinking",
+                "text": thinking,
+            }
+
+        # ----------------------------------------------------
+        # FINAL ANSWER
+        # ----------------------------------------------------
+
+        content = getattr(
+            chunk.message,
+            "content",
+            None
+        )
+
+        if content:
+
+            yield {
+                "type": "answer",
+                "text": content,
+            }
+
+
+# ============================================================
+# NDJSON SERIALIZATION
+# ============================================================
+
+def serialize_event(event):
+
+    return (
+        json.dumps(
+            event,
+            ensure_ascii=False
+        )
+        + "\n"
+    )
+
+
+# ============================================================
+# BACKGROUND MEMORY PROCESSING
+# ============================================================
+
+def process_memory_background(
+    user_message,
+    user_id
+):
+
+    try:
+
+        process_message(
+            user_message,
+            source_message_id=user_id,
+        )
+
+    except Exception as e:
+
+        # Memory processing should never crash the chat.
+        print(
+            f"[Memory processing error] {e}"
+        )
 
 
 # ============================================================
@@ -509,7 +587,6 @@ def chat():
             }
         ), 400
 
-
     # ========================================================
     # /CODE LIST
     # ========================================================
@@ -527,7 +604,6 @@ def chat():
             mimetype="text/plain; charset=utf-8",
         )
 
-
     # ========================================================
     # /CODE INSPECTION
     # ========================================================
@@ -537,7 +613,6 @@ def chat():
         filename = user_message[
             5:
         ].strip()
-
 
         if not filename:
 
@@ -553,11 +628,9 @@ def chat():
                 mimetype="text/plain; charset=utf-8",
             )
 
-
         code = read_own_code(
             filename
         )
-
 
         if code is None:
 
@@ -570,9 +643,8 @@ def chat():
                 mimetype="text/plain; charset=utf-8",
             )
 
-
         # ----------------------------------------------------
-        # SAVE THE CODE COMMAND TO CONVERSATION HISTORY
+        # SAVE CODE COMMAND
         # ----------------------------------------------------
 
         add_message(
@@ -580,12 +652,10 @@ def chat():
             user_message
         )
 
-
         context = build_code_context(
             filename,
             code
         )
-
 
         def generate_code_response():
 
@@ -593,14 +663,17 @@ def chat():
 
             try:
 
-                for text in stream_model(
+                for event in stream_model(
                     context
                 ):
 
-                    full_response += text
+                    if event["type"] == "answer":
 
-                    yield text
+                        full_response += event["text"]
 
+                    yield serialize_event(
+                        event
+                    )
 
                 # Save Ultron's code-inspection response.
                 add_message(
@@ -608,23 +681,23 @@ def chat():
                     full_response
                 )
 
-
             except Exception as e:
 
-                yield (
-                    f"\n[Ollama error: {str(e)}]"
+                yield serialize_event(
+                    {
+                        "type": "error",
+                        "text": str(e)
+                    }
                 )
-
 
         return Response(
             generate_code_response(),
-            mimetype="text/plain; charset=utf-8",
+            mimetype="application/x-ndjson",
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
             },
         )
-
 
     # ========================================================
     # NORMAL CHAT
@@ -634,17 +707,32 @@ def chat():
         user_message
     )
 
+    # Save the user's message first.
     user_id = add_message(
         "user",
         user_message
     )
 
+    # --------------------------------------------------------
+    # MEMORY PROCESSING
+    # --------------------------------------------------------
+    #
+    # Run memory extraction in the background so it doesn't
+    # delay the beginning of the Ollama response.
+    # --------------------------------------------------------
 
-    process_message(
-        user_message,
-        source_message_id=user_id,
-    )
+    threading.Thread(
+        target=process_memory_background,
+        args=(
+            user_message,
+            user_id,
+        ),
+        daemon=True
+    ).start()
 
+    # --------------------------------------------------------
+    # RESPONSE GENERATOR
+    # --------------------------------------------------------
 
     def generate():
 
@@ -652,31 +740,38 @@ def chat():
 
         try:
 
-            for text in stream_model(
+            for event in stream_model(
                 context
             ):
 
-                full_response += text
+                if event["type"] == "answer":
 
-                yield text
+                    full_response += event["text"]
 
+                yield serialize_event(
+                    event
+                )
+
+            # Save the complete assistant response
+            # after generation finishes.
 
             add_message(
                 "assistant",
                 full_response
             )
 
-
         except Exception as e:
 
-            yield (
-                f"\n[Ollama error: {str(e)}]"
+            yield serialize_event(
+                {
+                    "type": "error",
+                    "text": str(e)
+                }
             )
-
 
     return Response(
         generate(),
-        mimetype="text/plain; charset=utf-8",
+        mimetype="application/x-ndjson",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",

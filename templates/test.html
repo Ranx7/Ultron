@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Draggable and Falling Square</title>
+    <style>
+        #draggableSquare {
+            position: absolute;
+            width: 50px;
+            height: 50px;
+            background-color: blue;
+            cursor: move;
+        }
+    </style>
+</head>
+<body>
+
+<div id="draggableSquare"></div>
+
+<script>
+    const square = document.getElementById('draggableSquare');
+    let isDragging = false;
+    let startX, startY;
+    let velocityY = 0; // Gravity force
+    const gravity = 0.5; // Adjust this value to change the speed of fall
+
+    // Event listener for mousedown
+    square.addEventListener('mousedown', (e) => {
+        isDragging = true;
+        startX = e.clientX - square.offsetLeft;
+        startY = e.clientY - square.offsetTop;
+    });
+
+    // Event listener for mousemove
+    document.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+
+        const newX = e.clientX - startX;
+        const newY = e.clientY - startY + velocityY; // Apply gravity
+
+        square.style.left = `${newX}px`;
+        square.style.top = `${newY}px`;
+
+        // Check if the square has moved outside a certain threshold
+        const threshold = 50; // You can adjust this value as needed
+        if (
+            Math.abs(newX - startX) > threshold ||
+            Math.abs(newY - startY) > threshold
+        ) {
+            dropSquare();
+        }
+
+        // Update velocity due to gravity
+        velocityY += gravity;
+    });
+
+    // Event listener for mouseup
+    document.addEventListener('mouseup', () => {
+        isDragging = false;
+        velocityY = 0; // Reset velocity when released
+    });
+
+    function dropSquare() {
+        square.style.backgroundColor = 'red';
+        setTimeout(() => {
+            square.style.backgroundColor = 'blue';
+        }, 1000);
+    }
+</script>
+
+</body>
+</html>
