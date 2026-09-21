@@ -9,6 +9,9 @@ Responsibilities:
     memory candidate analysis
             |
             v
+    scope eligibility gate
+            |
+            v
     semantic duplicate search
             |
             v
@@ -24,10 +27,12 @@ Important architectural rules:
     - Recent context may be supplied for resolving references.
     - Old conversation history is NOT automatically searched here.
     - Assistant messages are never turned into memories.
+    - The LLM proposes memory candidates, but Python enforces
+      the final memory scope eligibility gate.
+    - General knowledge is never allowed into long-term memory.
     - Memories are stored as durable facts, preferences, goals,
       project information, decisions, corrections, etc.
     - Semantic similarity is used for deduplication.
-    - An LLM makes the actual memory-worthiness decision.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ from .database import (
 from .retrieval import semantic_search
 from .embeddings import embed_memory
 
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -57,13 +63,15 @@ OLLAMA_URL = os.getenv(
 
 OLLAMA_MODEL = os.getenv(
     "ULTRON_MEMORY_MODEL",
-    "Ultron:latest",
+    "Ultron-Memory:latest",
 )
 
 # Similarity above this value means an existing memory is
 # probably talking about the same thing.
 RELATED_MEMORY_THRESHOLD = 0.75
 
+# Extremely strong semantic match:
+# treat it as a duplicate without asking the small resolver model.
 AUTO_DUPLICATE_THRESHOLD = 0.85
 
 # Never allow one user message to create an unreasonable
@@ -84,6 +92,20 @@ ALLOWED_MEMORY_TYPES = {
     "correction",
 }
 
+# Candidate scope controls whether information is allowed
+# to enter long-term memory.
+ALLOWED_MEMORY_SCOPES = {
+    "user",
+    "project",
+    "general",
+}
+
+# Only these scopes are allowed through the Python memory gate.
+STORABLE_MEMORY_SCOPES = {
+    "user",
+    "project",
+}
+
 
 # ============================================================
 # Data structures
@@ -94,12 +116,18 @@ class MemoryCandidate:
     """
     A proposed durable memory extracted from the current
     user message.
+
+    scope:
+        user    -> durable information about the user
+        project -> durable information about a user project
+        general -> general knowledge / explanation / answer
     """
 
     content: str
     memory_type: str
     importance: float
     confidence: float
+    scope: str
 
 
 @dataclass
@@ -190,8 +218,11 @@ class OllamaMemoryAnalyzer:
             "stream": False,
             "format": "json",
             "options": {
-                "temperature": 0.1,
+                # Keep generation deterministic at runtime too,
+                # rather than relying only on the Modelfile.
+                "temperature": 0,
                 "top_p": 0.9,
+                "seed": 42,
             },
         }
 
@@ -207,10 +238,10 @@ class OllamaMemoryAnalyzer:
 
         try:
             return data["message"]["content"]
-        except (KeyError, TypeError):
+        except (KeyError, TypeError) as exc:
             raise RuntimeError(
                 "Ollama returned an unexpected response."
-            )
+            ) from exc
 
     # --------------------------------------------------------
     # First-stage memory extraction
@@ -227,61 +258,172 @@ class OllamaMemoryAnalyzer:
         )
 
         system_prompt = """
-You are Ultron's memory-analysis subsystem.
+You are Ultron's long-term memory extraction subsystem.
 
-Your job is NOT to answer the user.
+You are NOT a conversational assistant.
 
-Your job is to decide whether the CURRENT USER MESSAGE
-contains information worth remembering long-term.
+You do NOT answer the user's question.
 
-A durable memory should usually be something such as:
+You ONLY analyze the CURRENT USER MESSAGE and determine
+whether it contains durable information that could become
+long-term memory.
 
-- a stable user preference
-- an ongoing project
-- a technical environment or setup
-- a long-term goal
-- an important decision
-- a persistent fact about the user's work
-- a correction to information previously stored
-- a durable instruction about how the assistant should behave
+==================================================
+CORE MEMORY RULE
+==================================================
+
+Long-term memory is ONLY for information about:
+
+- the user
+- the user's preferences
+- the user's goals
+- the user's ongoing projects
+- the user's technical environment or setup
+- the user's persistent decisions
+- durable corrections to previously stored user/project information
+- durable instructions about how the user wants Ultron to behave
+
+The memory should describe the USER or the USER'S PROJECTS.
+
+Do NOT store general knowledge.
+
+Do NOT store explanations.
+
+Do NOT store definitions.
+
+Do NOT store tutorials.
+
+Do NOT store answers to questions.
+
+Do NOT store facts that are merely true about the world.
+
+==================================================
+DO NOT STORE
+==================================================
 
 Do NOT store:
 
 - greetings
 - small talk
 - jokes
-- temporary requests
-- ordinary questions
-- one-off calculations
-- transient emotional reactions
+- temporary situations
+- one-off requests
+- calculations
+- transient emotions
 - assistant-generated information
-- guesses or assumptions
-- information merely implied by the message
-- entire conversations
-- redundant copies of the same idea
+- guesses
+- assumptions
+- implied information
+- general technical knowledge
+- definitions
+- explanations
+- answers to ordinary questions
 
-Only store information actually supported by the user's words.
+Examples:
 
-Do not infer sensitive personal information.
+User:
+"How does semantic search work?"
 
-The current user message has priority.
-Recent context exists only to resolve references such as
-"that project", "the model I chose", or "my laptop".
+This is a question about general knowledge.
 
-Return ONLY valid JSON in this exact structure:
+The candidate, if represented, MUST use:
+"scope": "general"
 
-{
-  "memories": [
-    {
-      "content": "short durable statement",
-      "memory_type": "fact",
-      "importance": 0.0,
-      "confidence": 0.0
-    }
-  ]
-}
+User:
+"Semantic search uses embeddings to compare meaning."
 
-Valid memory_type values:
+This is general technical knowledge.
+
+Use:
+"scope": "general"
+
+User:
+"Python is an interpreted programming language."
+
+This is general knowledge.
+
+Use:
+"scope": "general"
+
+User:
+"Linux is an operating system."
+
+This is general knowledge.
+
+Use:
+"scope": "general"
+
+==================================================
+USER-SPECIFIC INFORMATION
+==================================================
+
+User:
+"I use MiniLM for semantic retrieval in Ultron."
+
+This is project information.
+
+Use:
+"scope": "project"
+
+User:
+"I prefer Python for automation."
+
+This is user preference information.
+
+Use:
+"scope": "user"
+
+User:
+"My main laptop runs Windows."
+
+This is user technical information.
+
+Use:
+"scope": "user"
+
+User:
+"I am building Ultron as a local AI assistant."
+
+This is project information.
+
+Use:
+"scope": "project"
+
+==================================================
+QUESTIONS
+==================================================
+
+If the user is asking a question and the message contains
+no separate durable user/project statement, classify any
+knowledge as "general" rather than user/project memory.
+
+A question must NOT become a user/project memory merely
+because the model knows how to answer it.
+
+==================================================
+CORRECTIONS
+==================================================
+
+Explicit changes to the user's own information or projects
+are durable.
+
+Examples:
+
+"I changed my preferred programming language from Java to Python."
+
+Use:
+"scope": "user"
+
+"Quartz Garden moved from Windows to Linux."
+
+Use:
+"scope": "project"
+
+==================================================
+MEMORY TYPES
+==================================================
+
+Allowed memory_type values:
 
 fact
 preference
@@ -291,11 +433,61 @@ technical
 decision
 correction
 
+==================================================
+SCOPES
+==================================================
+
+Every memory MUST have exactly one scope.
+
+Allowed scopes:
+
+user
+project
+general
+
+Use "user" for durable information about the user.
+
+Use "project" for durable information about the user's projects,
+systems, applications, codebases, or technical work.
+
+Use "general" for general knowledge, explanations,
+definitions, tutorials, answers to questions, or information
+that does not describe the user or their projects.
+
+==================================================
+OUTPUT
+==================================================
+
+Return ONLY valid JSON.
+
+Use exactly this structure:
+
+{
+  "memories": [
+    {
+      "content": "short durable statement",
+      "memory_type": "fact",
+      "importance": 0.0,
+      "confidence": 0.0,
+      "scope": "user"
+    }
+  ]
+}
+
 importance must be between 0 and 5.
 
 confidence must be between 0 and 1.
 
-Return an empty memories array when nothing should be stored.
+If there is no relevant information, return:
+
+{
+  "memories": []
+}
+
+Do not explain your reasoning.
+Do not answer the user's question.
+Do not include markdown.
+Do not include extra fields.
 """
 
         user_prompt = (
@@ -329,9 +521,10 @@ Return an empty memories array when nothing should be stored.
         system_prompt = """
 You are Ultron's memory-consolidation subsystem.
 
-Compare a NEW memory candidate against ONE EXISTING MEMORY.
+Compare ONE NEW USER/PROJECT MEMORY against ONE EXISTING
+MEMORY.
 
-Determine whether the new information should:
+Determine whether the new information should be:
 
 "duplicate"
     The existing memory already contains essentially the
@@ -348,6 +541,16 @@ Determine whether the new information should:
     They are related enough to inspect but are actually
     different facts and both should remain.
 
+Important:
+
+- The NEW memory represents the current user message.
+- The current information has priority when it explicitly
+  corrects the old information.
+- Do not preserve outdated information when the user clearly
+  says it has changed.
+- Do not invent information.
+- Return only the final durable memory statement.
+
 Return ONLY valid JSON:
 
 {
@@ -358,7 +561,10 @@ Return ONLY valid JSON:
 }
 
 The content field must contain only the final durable memory
-statement. Do not mention this comparison process.
+statement.
+
+Do not mention this comparison process.
+Do not explain your reasoning.
 """
 
         user_prompt = (
@@ -366,6 +572,8 @@ statement. Do not mention this comparison process.
             f"{candidate.content}\n\n"
             "NEW TYPE:\n"
             f"{candidate.memory_type}\n\n"
+            "NEW SCOPE:\n"
+            f"{candidate.scope}\n\n"
             "EXISTING MEMORY:\n"
             f"{existing_memory.get('content', '')}\n\n"
             "EXISTING TYPE:\n"
@@ -440,6 +648,22 @@ def _normalize_type(value: Any) -> str:
 
     if value not in ALLOWED_MEMORY_TYPES:
         return "fact"
+
+    return value
+
+
+def _normalize_scope(value: Any) -> str:
+    """
+    Normalize candidate scope.
+
+    Missing or invalid scopes are treated as "general"
+    rather than being allowed through as user/project memory.
+    """
+
+    value = str(value or "").strip().lower()
+
+    if value not in ALLOWED_MEMORY_SCOPES:
+        return "general"
 
     return value
 
@@ -520,6 +744,10 @@ def _parse_candidates(
             item.get("confidence")
         )
 
+        scope = _normalize_scope(
+            item.get("scope")
+        )
+
         # Low-confidence candidates are discarded here instead
         # of polluting long-term memory.
         if confidence < 0.60:
@@ -531,6 +759,7 @@ def _parse_candidates(
                 memory_type=memory_type,
                 importance=importance,
                 confidence=confidence,
+                scope=scope,
             )
         )
 
@@ -740,12 +969,13 @@ def _replace_memory(
     existing_memory: dict,
     action: MemoryAction,
     source_message_id: int | None,
+    scope: str,
 ) -> Any:
     """
     Replace an old memory while preserving the old record as
     archived history.
 
-    This avoids directly manipulating the memories table here.
+    The replacement keeps the scope of the current candidate.
     """
 
     archive_memory(
@@ -757,6 +987,7 @@ def _replace_memory(
         memory_type=action.memory_type,
         importance=action.importance,
         confidence=1.0,
+        scope=scope,
     )
 
     return _store_new_memory(
@@ -769,6 +1000,7 @@ def _merge_memory(
     existing_memory: dict,
     action: MemoryAction,
     source_message_id: int | None,
+    scope: str,
 ) -> Any:
     """
     Merge old + new semantic information into one durable
@@ -776,6 +1008,8 @@ def _merge_memory(
 
     The old record is archived and the consolidated record is
     stored as the active memory.
+
+    The merged memory keeps the scope of the current candidate.
     """
 
     archive_memory(
@@ -787,6 +1021,7 @@ def _merge_memory(
         memory_type=action.memory_type,
         importance=action.importance,
         confidence=1.0,
+        scope=scope,
     )
 
     return _store_new_memory(
@@ -821,12 +1056,15 @@ def process_message(
         }
     ]
 
-    Critical rule:
+    Critical rules:
 
         This function receives the current user message.
 
         It does NOT retrieve historical conversation to determine
         what the user meant.
+
+        Candidates marked "general" are rejected before semantic
+        retrieval or storage.
     """
 
     if not isinstance(message, str):
@@ -852,6 +1090,23 @@ def process_message(
         message,
         recent_context,
     )
+
+    if not candidates:
+        return []
+
+    # --------------------------------------------------------
+    # Phase 1.5:
+    # Hard Python scope gate.
+    #
+    # The LLM can classify something as "general", but the
+    # LLM is NOT allowed to override this final decision.
+    # --------------------------------------------------------
+
+    candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.scope in STORABLE_MEMORY_SCOPES
+    ]
 
     if not candidates:
         return []
@@ -883,6 +1138,7 @@ def process_message(
                     "content": candidate.content,
                     "memory_type": candidate.memory_type,
                     "importance": candidate.importance,
+                    "scope": candidate.scope,
                     "result": stored,
                 }
             )
@@ -899,11 +1155,14 @@ def process_message(
         # ----------------------------------------------------
 
         similarity = float(
-    existing.get("_similarity", 0.0)
-)
+            existing.get(
+                "_similarity",
+                0.0,
+            )
+        )
 
-# Very strong semantic match:
-# don't let the small LLM override the embedding signal.
+        # Very strong semantic match:
+        # don't let the small LLM override the embedding signal.
         if similarity >= AUTO_DUPLICATE_THRESHOLD:
             action = MemoryAction(
                 action="duplicate",
@@ -939,6 +1198,7 @@ def process_message(
                 existing,
                 action,
                 source_message_id,
+                candidate.scope,
             )
 
             results.append(
@@ -946,6 +1206,7 @@ def process_message(
                     "action": "replaced",
                     "content": action.content,
                     "archived_memory_id": existing["id"],
+                    "scope": candidate.scope,
                     "result": stored,
                 }
             )
@@ -958,6 +1219,7 @@ def process_message(
                 existing,
                 action,
                 source_message_id,
+                candidate.scope,
             )
 
             results.append(
@@ -965,6 +1227,7 @@ def process_message(
                     "action": "merged",
                     "content": action.content,
                     "archived_memory_id": existing["id"],
+                    "scope": candidate.scope,
                     "result": stored,
                 }
             )
@@ -992,6 +1255,7 @@ def process_message(
                     "_similarity",
                     0.0,
                 ),
+                "scope": candidate.scope,
                 "result": stored,
             }
         )
@@ -1014,6 +1278,9 @@ def get_manager_info() -> dict:
         "related_memory_threshold": (
             RELATED_MEMORY_THRESHOLD
         ),
+        "auto_duplicate_threshold": (
+            AUTO_DUPLICATE_THRESHOLD
+        ),
         "max_memories_per_message": (
             MAX_MEMORIES_PER_MESSAGE
         ),
@@ -1022,6 +1289,12 @@ def get_manager_info() -> dict:
         ),
         "allowed_memory_types": sorted(
             ALLOWED_MEMORY_TYPES
+        ),
+        "allowed_memory_scopes": sorted(
+            ALLOWED_MEMORY_SCOPES
+        ),
+        "storable_memory_scopes": sorted(
+            STORABLE_MEMORY_SCOPES
         ),
     }
 
@@ -1052,6 +1325,21 @@ class _MockAnalyzer:
                     memory_type="technical",
                     importance=3.0,
                     confidence=1.0,
+                    scope="user",
+                )
+            ]
+
+        if message == "GENERAL_TEST":
+            return [
+                MemoryCandidate(
+                    content=(
+                        "Python is a general-purpose "
+                        "programming language."
+                    ),
+                    memory_type="fact",
+                    importance=2.0,
+                    confidence=1.0,
+                    scope="general",
                 )
             ]
 
@@ -1073,8 +1361,9 @@ class _MockAnalyzer:
 
 def self_test() -> None:
     """
-    Test the manager's logic without writing anything to the
-    real database and without starting Ollama.
+    Test the manager's parsing and configuration logic without
+    writing anything to the real database and without starting
+    Ollama.
     """
 
     print("Memory manager self-test starting...")
@@ -1090,7 +1379,8 @@ def self_test() -> None:
                 "content": "The user uses Python.",
                 "memory_type": "technical",
                 "importance": 4,
-                "confidence": 0.95
+                "confidence": 0.95,
+                "scope": "user"
             }
         ]
     }
@@ -1115,6 +1405,106 @@ def self_test() -> None:
             "Candidate type parsing failed."
         )
 
+    if candidate.scope != "user":
+        raise RuntimeError(
+            "Candidate scope parsing failed."
+        )
+
+    # --------------------------------------------------------
+    # General scope parsing
+    # --------------------------------------------------------
+
+    general_raw = """
+    {
+        "memories": [
+            {
+                "content": "Python is a programming language.",
+                "memory_type": "fact",
+                "importance": 2,
+                "confidence": 0.95,
+                "scope": "general"
+            }
+        ]
+    }
+    """
+
+    general_candidates = _parse_candidates(
+        general_raw
+    )
+
+    if len(general_candidates) != 1:
+        raise RuntimeError(
+            "General scope parsing failed."
+        )
+
+    if general_candidates[0].scope != "general":
+        raise RuntimeError(
+            "General scope normalization failed."
+        )
+
+    # --------------------------------------------------------
+    # Invalid scope handling
+    # --------------------------------------------------------
+
+    invalid_scope_raw = """
+    {
+        "memories": [
+            {
+                "content": "Test invalid scope.",
+                "memory_type": "fact",
+                "importance": 2,
+                "confidence": 0.95,
+                "scope": "something_invalid"
+            }
+        ]
+    }
+    """
+
+    invalid_candidates = _parse_candidates(
+        invalid_scope_raw
+    )
+
+    if len(invalid_candidates) != 1:
+        raise RuntimeError(
+            "Invalid scope parsing failed."
+        )
+
+    if invalid_candidates[0].scope != "general":
+        raise RuntimeError(
+            "Invalid scope was not safely normalized."
+        )
+
+    # --------------------------------------------------------
+    # Missing scope handling
+    # --------------------------------------------------------
+
+    missing_scope_raw = """
+    {
+        "memories": [
+            {
+                "content": "Test missing scope.",
+                "memory_type": "fact",
+                "importance": 2,
+                "confidence": 0.95
+            }
+        ]
+    }
+    """
+
+    missing_scope_candidates = _parse_candidates(
+        missing_scope_raw
+    )
+
+    if len(missing_scope_candidates) != 1:
+        raise RuntimeError(
+            "Missing scope parsing failed."
+        )
+
+    if missing_scope_candidates[0].scope != "general":
+        raise RuntimeError(
+            "Missing scope was not safely normalized."
+        )
+
     # --------------------------------------------------------
     # Importance/confidence clamping
     # --------------------------------------------------------
@@ -1127,6 +1517,35 @@ def self_test() -> None:
     if _normalize_confidence(-10) != 0.0:
         raise RuntimeError(
             "Confidence clamp failed."
+        )
+
+    # --------------------------------------------------------
+    # Scope normalization
+    # --------------------------------------------------------
+
+    if _normalize_scope("USER") != "user":
+        raise RuntimeError(
+            "User scope normalization failed."
+        )
+
+    if _normalize_scope("PROJECT") != "project":
+        raise RuntimeError(
+            "Project scope normalization failed."
+        )
+
+    if _normalize_scope("GENERAL") != "general":
+        raise RuntimeError(
+            "General scope normalization failed."
+        )
+
+    if _normalize_scope("invalid") != "general":
+        raise RuntimeError(
+            "Invalid scope fallback failed."
+        )
+
+    if _normalize_scope(None) != "general":
+        raise RuntimeError(
+            "Missing scope fallback failed."
         )
 
     # --------------------------------------------------------
@@ -1166,6 +1585,11 @@ def self_test() -> None:
             "Mock analyzer failed."
         )
 
+    if results[0].scope != "user":
+        raise RuntimeError(
+            "Mock analyzer scope failed."
+        )
+
     action = analyzer.resolve(
         results[0],
         {
@@ -1191,6 +1615,21 @@ def self_test() -> None:
     if not info["ollama_model"]:
         raise RuntimeError(
             "Ollama model configuration is empty."
+        )
+
+    if "general" not in info["allowed_memory_scopes"]:
+        raise RuntimeError(
+            "General scope missing from configuration."
+        )
+
+    if "user" not in info["storable_memory_scopes"]:
+        raise RuntimeError(
+            "User scope missing from storable scopes."
+        )
+
+    if "project" not in info["storable_memory_scopes"]:
+        raise RuntimeError(
+            "Project scope missing from storable scopes."
         )
 
     print("Memory manager self-test passed.")
