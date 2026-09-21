@@ -1441,16 +1441,8 @@ def get_active_memory_embeddings(
     """
     Retrieve embeddings for all active memories.
 
-    Returned format:
-
-        {
-            "memory_id": int,
-            "dimensions": int,
-            "embedding": bytes
-        }
-
-    Keeping the blob here lets the retrieval layer decide whether
-    to decode using NumPy or another optimized method.
+    Embeddings are stored as float32 BLOBs in SQLite and are
+    deserialized before being returned to the retrieval layer.
     """
     conn = get_connection()
 
@@ -1474,7 +1466,10 @@ def get_active_memory_embeddings(
             {
                 "memory_id": int(row["memory_id"]),
                 "dimensions": int(row["dimensions"]),
-                "embedding": bytes(row["embedding"]),
+                "embedding": deserialize_embedding(
+                    bytes(row["embedding"]),
+                    int(row["dimensions"]),
+                ),
             }
             for row in rows
         ]
