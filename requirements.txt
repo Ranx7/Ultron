@@ -1,0 +1,5 @@
+Flask>=3.0,<4
+numpy>=1.26,<3
+ollama>=0.4,<1
+requests>=2.31,<3
+sentence-transformers>=3.0,<4
