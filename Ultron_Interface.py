@@ -7,6 +7,7 @@ import threading
 from memory.database import (
     initialize_database,
     add_message,
+    get_counts,
     get_recent_messages,
 )
 
@@ -767,13 +768,11 @@ def memory_search():
             }
         ), 400
 
+    # This inspection endpoint searches durable memories only. Conversation
+    # messages remain contextual data and are never retrieved to infer intent.
     return jsonify(
         {
-            "memories": search_memories(
-                query,
-                limit=20
-            ),
-            "conversation": search_conversation(
+            "memories": retrieve_memories(
                 query,
                 limit=20
             ),
