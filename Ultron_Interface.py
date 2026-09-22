@@ -7,14 +7,12 @@ import threading
 from memory.database import (
     initialize_database,
     add_message,
+    get_recent_messages,
 )
 
 from memory.retrieval import (
-    get_recent_messages,
-    search_memories,
-    search_conversation,
-    get_counts,
-    touch_memories,
+    format_memories_for_context,
+    retrieve_memories,
 )
 
 from memory.manager import process_message
@@ -143,24 +141,6 @@ CODE INSPECTION RULES:
 # MEMORY RETRIEVAL GATING
 # ============================================================
 
-MEMORY_HINTS = (
-    "remember",
-    "recall",
-    "forgot",
-    "forget",
-    "earlier",
-    "before",
-    "yesterday",
-    "last time",
-    "previous",
-    "what did i say",
-    "what was",
-    "we discussed",
-    "we talked about",
-    "do you remember",
-)
-
-
 SIMPLE_MESSAGES = {
     "hi",
     "hello",
@@ -181,11 +161,13 @@ SIMPLE_MESSAGES = {
 
 def should_retrieve_memory(user_message):
     """
-    Decide whether the user's message is asking about
-    previous information.
+    Decide whether the user's message can benefit from durable
+    long-term memory.
 
-    This prevents ordinary conversation from automatically
-    searching the long-term memory database.
+    Recent conversation is always handled separately.  This gate keeps
+    greetings and other lightweight social messages from loading the
+    embedding model, while allowing the hybrid retriever to supply
+    relevant durable facts for substantive requests.
     """
 
     text = " ".join(
@@ -199,11 +181,7 @@ def should_retrieve_memory(user_message):
     if text in SIMPLE_MESSAGES:
         return False
 
-    # Explicit references to previous information trigger retrieval.
-    return any(
-        hint in text
-        for hint in MEMORY_HINTS
-    )
+    return True
 
 
 # ============================================================
@@ -284,26 +262,13 @@ def build_context(user_message):
 
     if retrieve_memory:
 
-        memories = search_memories(
+        memories = retrieve_memories(
             user_message,
             limit=6
         )
 
         if memories:
-
-            memory_ids = [
-                m["id"]
-                for m in memories
-            ]
-
-            touch_memories(
-                memory_ids
-            )
-
-            memory_text = "\n".join(
-                f"- {m['content']}"
-                for m in memories
-            )
+            memory_text = format_memories_for_context(memories)
 
             context.append(
                 {
@@ -311,38 +276,6 @@ def build_context(user_message):
                     "content": (
                         "Relevant long-term memories:\n"
                         + memory_text
-                    ),
-                }
-            )
-
-        # ----------------------------------------------------
-        # RELEVANT OLD CONVERSATION
-        # ----------------------------------------------------
-
-        old = search_conversation(
-            user_message,
-            limit=4
-        )
-
-        if old:
-
-            old_text = "\n".join(
-                (
-                    f"[{m['created_at']}] "
-                    f"{m['role']}: "
-                    f"{m['content']}"
-                )
-                for m in old
-            )
-
-            context.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Relevant historical conversation excerpts.\n"
-                        "These may be from an earlier point in time and "
-                        "are provided only because they matched the topic:\n\n"
-                        + old_text
                     ),
                 }
             )
