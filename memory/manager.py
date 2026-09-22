@@ -39,7 +39,8 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -144,6 +145,8 @@ class MemoryCandidate:
     importance: float
     confidence: float
     scope: str
+    # Set only by deterministic validation; analyzer wording is unchanged.
+    validation_reason: str | None = None
 
 
 @dataclass
@@ -157,6 +160,197 @@ class MemoryAction:
     content: str
     memory_type: str
     importance: float
+
+
+@dataclass(frozen=True)
+class OwnershipEvidence:
+    """A small, current-message-only indication of durable ownership."""
+
+    scope: str
+    reason: str
+    clause: str
+    anchors: tuple[str, ...]
+
+
+# This is deliberately an eligibility filter, not a memory extractor.  It
+# keeps obvious non-memories away from the model without trying to word or
+# classify the memory itself.
+_COMMAND_PREFIXES = (
+    "/", "!", "please ", "tell me ", "show me ", "explain ",
+)
+_GREETING_RE = re.compile(
+    r"^(?:hi|hello|hey|good morning|good afternoon|good evening)[!. ]*$",
+    re.I,
+)
+_QUESTION_RE = re.compile(
+    r"^(?:what|when|where|why|who|how|can|could|would|should|is|are|do|does|did)\b",
+    re.I,
+)
+_CALCULATION_RE = re.compile(
+    r"^(?:calculate\s+)?[\d\s+*/().%^=-]+$",
+    re.I,
+)
+_TEMPORARY_RE = re.compile(
+    r"\b(?:right now|at the moment|currently|for now|today only)\b",
+    re.I,
+)
+_USER_PATTERNS = (
+    (re.compile(r"\bi\s+use\b", re.I), ("use",)),
+    (re.compile(r"\bi\s+prefer\b", re.I), ("prefer",)),
+    (re.compile(r"\bmy\s+main\b", re.I), ("main",)),
+)
+_PROJECT_PATTERNS = (
+    (re.compile(r"\bmy\s+project\b", re.I), ("project",)),
+    (re.compile(r"\bi\s+am\s+building\b", re.I), ("building",)),
+)
+_PROJECT_NAME_RE = re.compile(
+    r"\b(?:project\s+(?:called|named)\s+|my\s+project\s+(?:called|named)\s+|i\s+am\s+building\s+)"
+    r"[\"']?([A-Z][\w.-]*(?:\s+[A-Z][\w.-]*)*)[\"']?",
+    re.I,
+)
+
+
+def _message_ineligibility_reason(message: str) -> str | None:
+    """Return a short deterministic rejection reason for obvious non-memories."""
+
+    normalized = message.strip()
+    lowered = normalized.lower()
+    if not normalized:
+        return "empty_message"
+    if _GREETING_RE.fullmatch(normalized):
+        return "greeting"
+    if "joke" in lowered and any(
+        word in lowered
+        for word in ("tell", "make", "give", "know", "joke")
+    ):
+        return "joke_request"
+    if lowered.startswith(_COMMAND_PREFIXES):
+        return "command_or_request"
+    if _CALCULATION_RE.fullmatch(normalized):
+        return "calculation"
+    if _TEMPORARY_RE.search(normalized):
+        return "explicitly_temporary"
+
+    # Questions that also contain an ownership statement may still have a
+    # durable declarative clause; ordinary questions do not need the model.
+    if (
+        normalized.endswith("?") or _QUESTION_RE.match(normalized)
+    ) and not _ownership_evidence(normalized):
+        return "ordinary_question"
+    return None
+
+
+def _ownership_evidence(message: str) -> list[OwnershipEvidence]:
+    """Find only the few explicit user/project signals supported by this gate."""
+
+    evidence: list[OwnershipEvidence] = []
+    for clause in filter(None, re.split(r"[.!?;\n]+", message)):
+        for pattern, anchors in _USER_PATTERNS:
+            if pattern.search(clause):
+                evidence.append(
+                    OwnershipEvidence("user", pattern.pattern, clause, anchors)
+                )
+        for pattern, anchors in _PROJECT_PATTERNS:
+            if pattern.search(clause):
+                evidence.append(
+                    OwnershipEvidence("project", pattern.pattern, clause, anchors)
+                )
+        for match in _PROJECT_NAME_RE.finditer(clause):
+            name = match.group(1).strip().rstrip(".")
+            evidence.append(
+                OwnershipEvidence(
+                    "project",
+                    "explicit_project_name",
+                    clause,
+                    (name.lower(),),
+                )
+            )
+    return evidence
+
+
+def _candidate_ownership_scope(
+    candidate: MemoryCandidate,
+    evidence: list[OwnershipEvidence],
+) -> tuple[str, str] | None:
+    """Return proven scope and reason without rewriting model-provided content."""
+
+    content = candidate.content.lower()
+    for item in evidence:
+        anchors = item.anchors
+        if item.scope == "user":
+            # A rewritten candidate must retain both an ownership marker and
+            # the statement's predicate; a shared noun alone is not enough.
+            if (
+                "user" in content
+                or "my " in content
+                or content.startswith("i ")
+            ) and any(anchor in content for anchor in anchors):
+                return item.scope, item.reason
+        elif (
+            "project" in content
+            or "building" in content
+            or any(anchor in content for anchor in anchors)
+        ):
+            return item.scope, item.reason
+    return None
+
+
+def _validate_candidates(
+    candidates: list[MemoryCandidate],
+    message: str,
+) -> tuple[list[MemoryCandidate], list[dict[str, str]]]:
+    """Keep candidates tied to explicit current-message ownership evidence."""
+
+    evidence = _ownership_evidence(message)
+    accepted: list[MemoryCandidate] = []
+    diagnostics: list[dict[str, str]] = []
+    for candidate in candidates:
+        ownership = _candidate_ownership_scope(candidate, evidence)
+        if candidate.scope == "general":
+            if ownership is None:
+                diagnostics.append(
+                    {
+                        "action": "rejected",
+                        "stage": "candidate_validation",
+                        "reason": "general_candidate_without_current_message_ownership",
+                    }
+                )
+                continue
+            scope, reason = ownership
+            accepted.append(
+                replace(
+                    candidate,
+                    scope=scope,
+                    validation_reason=f"current_message_ownership:{reason}",
+                )
+            )
+            diagnostics.append(
+                {
+                    "action": "scope_corrected",
+                    "stage": "candidate_validation",
+                    "reason": f"current_message_ownership:{reason}",
+                }
+            )
+            continue
+        if ownership is None:
+            diagnostics.append(
+                {
+                    "action": "rejected",
+                    "stage": "candidate_validation",
+                    "reason": "durable_scope_without_current_message_ownership",
+                }
+            )
+            continue
+        accepted.append(candidate)
+    return accepted, diagnostics
+
+
+def _validation_metadata(candidate: MemoryCandidate) -> dict[str, str]:
+    """Expose a scope correction in the action record for auditability."""
+
+    if candidate.validation_reason is None:
+        return {}
+    return {"validation_reason": candidate.validation_reason}
 
 
 # ============================================================
@@ -848,8 +1042,10 @@ def process_message(
         It does NOT retrieve historical conversation to determine
         what the user meant.
 
-        Candidates marked "general" are rejected before semantic
-        retrieval or storage.
+        Obvious commands, questions, temporary statements, and similar
+        non-memories are rejected before analysis. Candidate ownership is
+        then validated against the current message before retrieval or
+        storage; recent context is never used for either decision.
     """
 
     if not isinstance(message, str):
@@ -860,6 +1056,12 @@ def process_message(
     message = message.strip()
 
     if not message:
+        return []
+
+    # This decision intentionally inspects the current message only.  Context
+    # is supplied to the analyzer later, solely to resolve references after
+    # eligibility has already been established.
+    if _message_ineligibility_reason(message) is not None:
         return []
 
     if analyzer is None:
@@ -880,18 +1082,15 @@ def process_message(
         return []
 
     # --------------------------------------------------------
-    # Phase 1.5:
-    # Hard Python scope gate.
-    #
-    # The LLM can classify something as "general", but the
-    # LLM is NOT allowed to override this final decision.
+    # Phase 1.5: deterministic current-message ownership validation.
+    # The model supplies wording and type, but Python verifies that a durable
+    # scope is actually tied to the user or project in this message.
     # --------------------------------------------------------
 
-    candidates = [
-        candidate
-        for candidate in candidates
-        if candidate.scope in STORABLE_MEMORY_SCOPES
-    ]
+    candidates, _validation_diagnostics = _validate_candidates(
+        candidates,
+        message,
+    )
 
     if not candidates:
         return []
@@ -925,6 +1124,7 @@ def process_message(
                     "importance": candidate.importance,
                     "scope": candidate.scope,
                     "result": stored,
+                    **_validation_metadata(candidate),
                 }
             )
 
@@ -972,6 +1172,7 @@ def process_message(
                         "_similarity",
                         0.0,
                     ),
+                    **_validation_metadata(candidate),
                 }
             )
 
@@ -993,6 +1194,7 @@ def process_message(
                     "archived_memory_id": existing["id"],
                     "scope": candidate.scope,
                     "result": stored,
+                    **_validation_metadata(candidate),
                 }
             )
 
@@ -1014,6 +1216,7 @@ def process_message(
                     "archived_memory_id": existing["id"],
                     "scope": candidate.scope,
                     "result": stored,
+                    **_validation_metadata(candidate),
                 }
             )
 
@@ -1042,6 +1245,7 @@ def process_message(
                 ),
                 "scope": candidate.scope,
                 "result": stored,
+                **_validation_metadata(candidate),
             }
         )
 

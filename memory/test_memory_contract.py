@@ -9,9 +9,9 @@ import pytest
 from memory import manager
 
 
-def _model_json(scope: str | None) -> str:
+def _model_json(scope: str | None, content: str = "A durable candidate.") -> str:
     memory = {
-        "content": "A durable candidate.",
+        "content": content,
         "memory_type": "fact",
         "importance": 3,
         "confidence": 0.95,
@@ -50,18 +50,20 @@ class _JsonAnalyzer:
 
 
 @pytest.mark.parametrize(
-    ("scope", "should_store"),
+    ("scope", "message", "content", "should_store"),
     [
-        (None, False),
-        ("invalid", False),
-        ("general", False),
-        ("user", True),
-        ("project", True),
+        (None, "Python is interpreted.", "Python is interpreted.", False),
+        ("invalid", "Python is interpreted.", "Python is interpreted.", False),
+        ("general", "Python is interpreted.", "Python is interpreted.", False),
+        ("user", "I prefer Python.", "The user prefers Python.", True),
+        ("project", "I am building Atlas.", "Atlas is being built by the user.", True),
     ],
 )
 def test_only_valid_durable_scopes_reach_storage(
     monkeypatch: pytest.MonkeyPatch,
     scope: str | None,
+    message: str,
+    content: str,
     should_store: bool,
 ) -> None:
     stored_scopes: list[str] = []
@@ -74,8 +76,8 @@ def test_only_valid_durable_scopes_reach_storage(
     )
 
     result = manager.process_message(
-        "A user message.",
-        analyzer=_JsonAnalyzer(_model_json(scope)),
+        message,
+        analyzer=_JsonAnalyzer(_model_json(scope, content)),
     )
 
     assert bool(result) is should_store
